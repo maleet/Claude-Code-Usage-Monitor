@@ -23,6 +23,8 @@ pub const POLL_1_HOUR: u32 = POLL_1_HOUR_SECONDS * 1_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SettingsFile {
+    #[serde(default)]
+    pub usage_alerts: crate::alerts::AlertSettings,
     #[serde(default, skip_serializing)]
     pub tray_offset: i32,
     #[serde(default, skip_serializing)]
@@ -69,6 +71,7 @@ pub struct SettingsFile {
 impl Default for SettingsFile {
     fn default() -> Self {
         Self {
+            usage_alerts: crate::alerts::AlertSettings::default(),
             tray_offset: 0,
             taskbar_index: 0,
             legacy_placement_pending: false,
@@ -99,6 +102,7 @@ pub struct LegacyPlacement {
 
 impl SettingsFile {
     pub fn normalize(&mut self) {
+        self.usage_alerts.normalize();
         if !matches!(
             self.poll_interval_ms,
             POLL_1_MIN | POLL_5_MIN | POLL_15_MIN | POLL_1_HOUR
@@ -327,6 +331,23 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_settings_gain_alert_defaults_without_changing_provider_selection() {
+        let mut settings =
+            decode_settings(r#"{"show_claude_code":false,"show_codex":true}"#).unwrap();
+        settings.normalize();
+        assert!(settings.usage_alerts.enabled);
+        assert_eq!(settings.usage_alerts.thresholds, vec![80, 90, 95]);
+        assert_eq!(
+            settings.enabled_providers(),
+            ProviderSet::from_enabled([ProviderId::Codex])
+        );
+        settings.usage_alerts.enabled = false;
+        let decoded = decode_settings(&settings_json(&settings).to_string()).unwrap();
+        assert!(!decoded.usage_alerts.enabled);
+        assert_eq!(decoded.enabled_providers(), settings.enabled_providers());
+    }
 
     #[test]
     fn account_migration_distinguishes_missing_from_explicitly_empty() {

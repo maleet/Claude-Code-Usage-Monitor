@@ -129,6 +129,20 @@ pub(super) unsafe extern "system" fn wnd_proc(
             request_poll(hwnd);
             LRESULT(0)
         }
+        crate::native_interop::WM_APP_TEST_USAGE_ALERT => {
+            // Restore the notification source, including in --no-poll test mode.
+            sync_tray_icon(hwnd);
+            if crate::tray_icon::notify_balloon(
+                hwnd,
+                "Usage limit warning - test",
+                "Usage notifications are working. Alerts are checked after each usage refresh.",
+            ) {
+                crate::diagnose::log("Test usage notification accepted by Windows");
+            } else {
+                crate::diagnose::log("Windows rejected the test usage notification");
+            }
+            LRESULT(0)
+        }
         WM_APP_OPEN_DASHBOARD => {
             crate::dashboard::show(hwnd);
             LRESULT(0)

@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod accounts;
+mod alerts;
 mod app_settings;
 mod codex_oauth;
 mod context_menu;

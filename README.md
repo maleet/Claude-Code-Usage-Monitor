@@ -3,6 +3,10 @@
 
 # Claude Code Usage Monitor
 
+This custom build adds Windows usage notifications at 80%, 90%, and 95%,
+configurable in **Settings > Usage alerts**. See [ALERTS.md](ALERTS.md) for behaviour,
+validation, and build notes.
+
 ![Screenshot](.github/animation.gif)
 
 A lightweight Windows taskbar widget for people already using Claude Code, with optional Codex, Google Antigravity, OpenCode Go, and Cursor usage display.

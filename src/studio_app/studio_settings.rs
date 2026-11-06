@@ -72,6 +72,80 @@ impl StudioApp {
                     },
                 );
             });
+            section(ui, language.text("Usage alerts"), |ui| {
+                setting_row(
+                    ui,
+                    language.text("Desktop notifications"),
+                    language.text("Warn when usage reaches a selected threshold"),
+                    |ui| {
+                        changed |= Toggle::new(&mut self.settings.usage_alerts.enabled)
+                            .labels(language.text("Enabled"), language.text("Disabled"))
+                            .show(ui)
+                            .changed();
+                    },
+                );
+                setting_separator(ui);
+                ui.add_enabled_ui(self.settings.usage_alerts.enabled, |ui| {
+                    setting_row(
+                        ui,
+                        language.text("Usage windows"),
+                        language.text("Check session and long-term limits independently"),
+                        |ui| {
+                            changed |= ui
+                                .checkbox(&mut self.settings.usage_alerts.session, "5h")
+                                .changed();
+                            changed |= ui
+                                .checkbox(&mut self.settings.usage_alerts.weekly, "7d / long-term")
+                                .changed();
+                        },
+                    );
+                    setting_separator(ui);
+                    setting_row(
+                        ui,
+                        language.text("Alert thresholds"),
+                        language.text("Once per threshold and window, remembered across restarts"),
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                // Setting controls flow from right to left.
+                                for threshold in [95u8, 90, 80] {
+                                    let mut selected =
+                                        self.settings.usage_alerts.thresholds.contains(&threshold);
+                                    if ui
+                                        .checkbox(&mut selected, format!("{threshold}%"))
+                                        .changed()
+                                    {
+                                        changed = true;
+                                        self.settings
+                                            .usage_alerts
+                                            .thresholds
+                                            .retain(|value| *value != threshold);
+                                        if selected {
+                                            self.settings.usage_alerts.thresholds.push(threshold);
+                                        }
+                                        self.settings.usage_alerts.normalize();
+                                    }
+                                }
+                            });
+                        },
+                    );
+                });
+                setting_separator(ui);
+                setting_row(
+                    ui,
+                    language.text("Test notification"),
+                    language.text("Windows controls notification banners and sound"),
+                    |ui| {
+                        if ui.button(language.text("Send test notification")).clicked() {
+                            self.post_owner(crate::native_interop::WM_APP_TEST_USAGE_ALERT);
+                        }
+                    },
+                );
+                ui.label(
+                    language.text(
+                        "Alerts follow Update frequency. Use Every minute for timely warnings.",
+                    ),
+                );
+            });
             section(ui, language.text("Providers"), |ui| {
                 for (index, descriptor) in PROVIDER_DESCRIPTORS.iter().enumerate() {
                     if index > 0 {

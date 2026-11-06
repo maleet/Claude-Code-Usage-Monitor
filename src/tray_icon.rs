@@ -252,7 +252,7 @@ pub fn sync_themed(hwnd: HWND, icons: &[ThemedTrayIcon]) {
 }
 
 /// Show a Windows balloon notification from the application tray icon.
-pub fn notify_balloon(hwnd: HWND, title: &str, message: &str) {
+pub fn notify_balloon(hwnd: HWND, title: &str, message: &str) -> bool {
     let icon_id = REGISTERED_THEME_ICON_IDS
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -268,7 +268,7 @@ pub fn notify_balloon(hwnd: HWND, title: &str, message: &str) {
         nid.dwInfoFlags = NIIF_WARNING;
         copy_wide(title, &mut nid.szInfoTitle);
         copy_wide(message, &mut nid.szInfo);
-        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+        Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool()
     }
 }
 

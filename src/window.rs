@@ -2040,6 +2040,7 @@ fn do_poll_once(hwnd: HWND) {
             }
             drop(state);
             let _ = app_settings::save_usage_cache(&cache_data, true);
+            crate::alerts::check(hwnd, &current, &cache_data);
 
             unsafe {
                 let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
@@ -2120,7 +2121,7 @@ fn do_poll_once(hwnd: HWND) {
                         .map(|state| state.language.provider_auth_error(failure.provider))
                 };
                 if let Some((title, body)) = balloon {
-                    tray_icon::notify_balloon(hwnd, title, body);
+                    let _ = tray_icon::notify_balloon(hwnd, title, body);
                 }
             }
 
