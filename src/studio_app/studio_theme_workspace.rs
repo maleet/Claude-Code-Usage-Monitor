@@ -3,7 +3,7 @@ use super::*;
 impl StudioApp {
     pub(super) fn studio_page(&mut self, ui: &mut egui::Ui) {
         let language = self.language();
-        let themes = available_themes(self.theme_path.as_deref(), &self.theme);
+        let themes = self.available_themes();
         let mut requested_theme = None;
         let read_only = self.theme_is_read_only();
         let can_delete = !read_only
@@ -22,7 +22,7 @@ impl StudioApp {
                     self.theme.name.clone()
                 })
                 .show_ui(ui, |ui| {
-                    for theme in &themes {
+                    for theme in themes.iter() {
                         let selected = self.theme_path.as_deref() == Some(theme.path.as_path());
                         if dropdown_selectable_label(ui, selected, &theme.label).clicked() {
                             requested_theme = Some(theme.path.clone());
@@ -129,16 +129,12 @@ impl StudioApp {
         ui.separator();
         ui.add_space(8.0);
 
-        if self.text_template_helper.is_some() {
-            self.text_template_helper_ui(ui);
-            return;
-        }
-        if self.action_helper.is_some() {
-            self.action_helper_ui(ui);
-            return;
-        }
-        if self.expression_helper.is_some() {
-            self.expression_helper_ui(ui);
+        if self
+            .helper
+            .as_ref()
+            .is_some_and(|helper| !helper.target.is_context_menu())
+        {
+            self.helper_ui(ui);
             return;
         }
         if self.asset_picker.is_some() {
@@ -262,7 +258,7 @@ impl StudioApp {
     pub(super) fn import_asset_from_dialog(&mut self) -> Option<theme_engine::ManagedAsset> {
         let language = self.language();
         let filter = format!(
-            "{}\0*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp\0{}\0*.*\0\0",
+            "{}\0*.png;*.jpg;*.jpeg;*.gif;*.webp\0{}\0*.*\0\0",
             language.text("Images"),
             language.text("All files")
         );
@@ -294,13 +290,11 @@ impl StudioApp {
     pub(super) fn handle_dropped_files(&mut self, context: &egui::Context) {
         let dropped = context.input(|input| input.raw.dropped_files.clone());
         for file in dropped {
-            let Some(path) = file.path else {
-                continue;
-            };
-            if theme_package::is_theme_package(&path) {
-                self.import_theme_path(&path);
+            let path = file.path();
+            if theme_package::is_theme_package(path) {
+                self.import_theme_path(path);
             } else if self.page == Page::Assets {
-                if let Some(asset) = self.import_asset_path(&path) {
+                if let Some(asset) = self.import_asset_path(path) {
                     self.asset_page_selected = Some(asset.relative_path);
                 }
             }
@@ -490,389 +484,6 @@ impl StudioApp {
         }
     }
 
-    pub(super) fn text_template_helper_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(mut helper) = self.text_template_helper.take() else {
-            return;
-        };
-        let language = self.language();
-        let context = match &helper.target {
-            TextTemplateHelperTarget::Theme(selection) => self.expression_context(*selection),
-            TextTemplateHelperTarget::ContextMenu(_) => DataContext::from_usage_with_runtime(
-                self.usage.as_ref(),
-                &Canvas::default(),
-                self.theme_runtime(),
-            ),
-        };
-        let action = show_text_helper(
-            ui,
-            &mut helper.editor,
-            language,
-            |draft| theme_engine::validate_template(draft, &context),
-            |draft| theme_engine::format_template(draft, &context),
-            |ui, editor, panel_height| {
-                let account_names = context.account_names();
-                if !account_names.is_empty() {
-                    ui.menu_button(language.text("Insert account value"), |ui| {
-                        for (key, name) in &account_names {
-                            ui.menu_button(name, |ui| {
-                                for (label, suffix) in [
-                                    ("Name", "name"),
-                                    ("Colour", "color"),
-                                    ("Status", "status"),
-                                    ("5h", "session:usage_line"),
-                                    ("7d", "weekly:usage_line"),
-                                ] {
-                                    if ui.button(language.text(label)).clicked() {
-                                        editor.draft.push_str(&format!("{{{key}.{suffix}}}"));
-                                        ui.close();
-                                    }
-                                }
-                            });
-                        }
-                    });
-                }
-                let panel_gap = ui.spacing().item_spacing.x;
-                let usable_width = (ui.available_width() - panel_gap * 2.0).max(1.0);
-                let values_width = usable_width * 0.45;
-                let formats_width = usable_width * 0.31;
-                let guide_width = (usable_width - values_width - formats_width).max(1.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), panel_height),
-                    egui::Layout::left_to_right(egui::Align::Min),
-                    |ui| {
-                        text_template_values_panel(
-                            ui,
-                            egui::vec2(values_width, panel_height),
-                            &context,
-                            &mut editor.value_filter,
-                            &mut editor.selected_value,
-                            &mut editor.selected_format,
-                            language,
-                        );
-                        text_template_formats_panel(
-                            ui,
-                            egui::vec2(formats_width, panel_height),
-                            &context,
-                            editor.selected_value,
-                            &mut editor.selected_format,
-                            &mut editor.draft,
-                            language,
-                        );
-                        text_template_guide_panel(ui, guide_width, panel_height, language);
-                    },
-                );
-            },
-        );
-
-        match action {
-            TextHelperAction::Close => {}
-            TextHelperAction::Apply => match helper.target {
-                TextTemplateHelperTarget::Theme(selection) => {
-                    let applied = match selection {
-                        Selection::Surface(surface_index) => self
-                            .theme
-                            .surfaces
-                            .get_mut(surface_index)
-                            .is_some_and(|surface| {
-                                set_text_template(&mut surface.content, helper.editor.draft.clone())
-                            }),
-                        Selection::Object(surface_index, object_index) => self
-                            .theme
-                            .surfaces
-                            .get_mut(surface_index)
-                            .and_then(|surface| surface.children.get_mut(object_index))
-                            .is_some_and(|object| {
-                                set_text_template(&mut object.content, helper.editor.draft.clone())
-                            }),
-                    };
-                    if applied {
-                        self.selection = selection;
-                        self.changed();
-                    }
-                }
-                TextTemplateHelperTarget::ContextMenu(path) => {
-                    if let Some(item) = context_menu_item_mut(&mut self.context_menu.items, &path) {
-                        item.label = helper.editor.draft;
-                        self.context_menu_selection = Some(path);
-                        self.context_menu_dirty = true;
-                    }
-                }
-            },
-            TextHelperAction::Continue => self.text_template_helper = Some(helper),
-        }
-    }
-
-    pub(super) fn expression_helper_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(mut helper) = self.expression_helper.take() else {
-            return;
-        };
-        let language = self.language();
-        let context = self.expression_context(helper.selection);
-        let action = show_expression_helper(
-            ui,
-            &mut helper.editor,
-            language,
-            |draft| {
-                theme_engine::evaluate(draft, &context).and_then(|value| {
-                    value
-                        .is_finite()
-                        .then(|| format_expression_result(helper.field, value, language))
-                        .ok_or_else(|| language.text("Expression result is not finite").to_string())
-                })
-            },
-            |ui, editor, panel_height| {
-                let panel_gap = ui.spacing().item_spacing.x;
-                let panel_width = ((ui.available_width() - panel_gap * 2.0) / 3.0).max(1.0);
-                ui.horizontal(|ui| {
-                    expression_variables_panel(
-                        ui,
-                        panel_width,
-                        panel_height,
-                        &context,
-                        &mut editor.variable_filter,
-                        &mut editor.draft,
-                        language,
-                    );
-                    expression_functions_panel(
-                        ui,
-                        panel_width,
-                        panel_height,
-                        &mut editor.function_filter,
-                        &mut editor.draft,
-                        language,
-                    );
-                    expression_operators_panel(
-                        ui,
-                        panel_width,
-                        panel_height,
-                        &mut editor.draft,
-                        language,
-                    );
-                });
-            },
-        );
-
-        match action {
-            ExpressionHelperAction::Close => {}
-            ExpressionHelperAction::Apply => {
-                let expression = Expression(helper.editor.draft);
-                let applied = match helper.selection {
-                    Selection::Surface(surface_index) => self
-                        .theme
-                        .surfaces
-                        .get_mut(surface_index)
-                        .map(|surface| match helper.field {
-                            ExpressionField::Render => {
-                                surface.render = expression;
-                                true
-                            }
-                            ExpressionField::Visibility => {
-                                surface.visibility = expression;
-                                true
-                            }
-                            ExpressionField::ObjectWidth => {
-                                surface.width = expression;
-                                true
-                            }
-                            ExpressionField::ObjectHeight => {
-                                surface.height = expression;
-                                true
-                            }
-                            ExpressionField::PlacementOffsetX => {
-                                surface.placement.offset_x_expression = Some(expression);
-                                true
-                            }
-                            ExpressionField::PlacementOffsetY => {
-                                surface.placement.offset_y_expression = Some(expression);
-                                true
-                            }
-                            field => set_object_expression(surface, field, expression),
-                        })
-                        .unwrap_or(false),
-                    Selection::Object(surface_index, object_index) => self
-                        .theme
-                        .surfaces
-                        .get_mut(surface_index)
-                        .and_then(|surface| surface.children.get_mut(object_index))
-                        .is_some_and(|object| {
-                            set_object_expression(object, helper.field, expression)
-                        }),
-                };
-                if applied {
-                    self.selection = helper.selection;
-                    self.changed();
-                }
-            }
-            ExpressionHelperAction::Continue => self.expression_helper = Some(helper),
-        }
-    }
-
-    pub(super) fn action_helper_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(mut helper) = self.action_helper.take() else {
-            return;
-        };
-        let language = self.language();
-        let surface_index = match helper.selection {
-            Selection::Surface(surface) | Selection::Object(surface, _) => surface,
-        };
-        let Some(surface) = self.theme.surfaces.get(surface_index) else {
-            return;
-        };
-        let self_id = match helper.selection {
-            Selection::Surface(_) => surface.id.clone(),
-            Selection::Object(_, object) => surface
-                .children
-                .get(object)
-                .map(|object| object.id.clone())
-                .unwrap_or_else(|| surface.id.clone()),
-        };
-        let targets = self
-            .theme
-            .surfaces
-            .iter()
-            .flat_map(|root| {
-                std::iter::once((root.id.clone(), root.name.clone())).chain(
-                    root.children
-                        .iter()
-                        .map(|object| (object.id.clone(), object.name.clone())),
-                )
-            })
-            .collect::<Vec<_>>();
-        let context = self.expression_context(helper.selection);
-        let mut target = helper.target.clone();
-        let mut property = helper.property;
-        let mut value = helper.value.clone();
-        let context_menus = context_menu::list_context_menus().unwrap_or_default();
-        let mut context_menu_reference = helper.context_menu_reference.clone();
-        let action = show_action_helper(
-            ui,
-            &mut helper.editor,
-            language,
-            "Build safe mouse actions that affect layers at runtime.",
-            |draft| {
-                let errors = theme_engine::validate_mouse_action_script(
-                    draft,
-                    &self.theme,
-                    surface_index,
-                    &self_id,
-                    &context,
-                );
-                if errors.is_empty() {
-                    let count = theme_engine::parse_mouse_actions(draft)?.len();
-                    Ok(format!("{count} {}", language.text("actions")))
-                } else {
-                    Err(errors.join("\n"))
-                }
-            },
-            |ui, editor, panel_height| {
-                action_reference_panels(
-                    ui,
-                    panel_height,
-                    &targets,
-                    &self_id,
-                    &mut target,
-                    &mut property,
-                    &mut value,
-                    &context_menus,
-                    &mut context_menu_reference,
-                    &mut editor.draft,
-                    language,
-                );
-            },
-        );
-
-        match action {
-            ExpressionHelperAction::Close => {}
-            ExpressionHelperAction::Apply => {
-                let draft = helper.editor.draft;
-                let applied = match helper.selection {
-                    Selection::Surface(index) => self.theme.surfaces.get_mut(index),
-                    Selection::Object(surface, object) => self
-                        .theme
-                        .surfaces
-                        .get_mut(surface)
-                        .and_then(|surface| surface.children.get_mut(object)),
-                }
-                .is_some_and(|object| {
-                    let events = object.mouse_events.get_or_insert_with(MouseEvents::default);
-                    *events.handler_mut(helper.field.kind()) = draft;
-                    true
-                });
-                if applied {
-                    self.selection = helper.selection;
-                    self.changed();
-                }
-            }
-            ExpressionHelperAction::Continue => {
-                helper.target = target;
-                helper.property = property;
-                helper.value = value;
-                helper.context_menu_reference = context_menu_reference;
-                self.action_helper = Some(helper);
-            }
-        }
-    }
-
-    pub(super) fn context_menu_action_helper_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(mut helper) = self.context_menu_action_helper.take() else {
-            return;
-        };
-        let language = self.language();
-        let layer_targets = self
-            .theme
-            .surfaces
-            .iter()
-            .flat_map(|root| {
-                std::iter::once((root.id.clone(), root.name.clone())).chain(
-                    root.children
-                        .iter()
-                        .map(|object| (object.id.clone(), object.name.clone())),
-                )
-            })
-            .collect::<Vec<_>>();
-        let action = show_action_helper(
-            ui,
-            &mut helper.editor,
-            language,
-            "Choose one action for this context menu item.",
-            |draft| {
-                parse_context_menu_action_script(draft)?;
-                Ok(language.text("One menu action").into())
-            },
-            |ui, editor, panel_height| {
-                context_menu_action_reference_panels(
-                    ui,
-                    panel_height,
-                    &layer_targets,
-                    &mut helper.target,
-                    &mut helper.property,
-                    &mut helper.value,
-                    &mut editor.draft,
-                    language,
-                );
-            },
-        );
-
-        match action {
-            ExpressionHelperAction::Close => {}
-            ExpressionHelperAction::Apply => {
-                match parse_context_menu_action_script(&helper.editor.draft) {
-                    Ok(action) => {
-                        if let Some(item) =
-                            context_menu_item_mut(&mut self.context_menu.items, &helper.path)
-                        {
-                            item.kind = ContextMenuItemKind::Action { action };
-                            self.context_menu_selection = Some(helper.path);
-                            self.context_menu_dirty = true;
-                        }
-                    }
-                    Err(error) => self.theme_error = Some(error),
-                }
-            }
-            ExpressionHelperAction::Continue => self.context_menu_action_helper = Some(helper),
-        }
-    }
-
     pub(super) fn expression_context(&self, selection: Selection) -> DataContext {
         let surface_index = match selection {
             Selection::Surface(surface) | Selection::Object(surface, _) => surface,
@@ -880,11 +491,12 @@ impl StudioApp {
         let Some(surface) = self.theme.surfaces.get(surface_index) else {
             return DataContext::default();
         };
+        let runtime = self.theme_runtime_for_surface(surface_index);
         let (width, height) = theme_engine::resolve_surface_size(
             &self.theme,
             surface_index,
             self.usage.as_ref(),
-            self.theme_runtime(),
+            runtime,
         );
         let canvas = Canvas {
             width,
@@ -898,7 +510,19 @@ impl StudioApp {
                 | theme_engine::LayerBackground::Image { .. } => Paint::default(),
             },
         };
-        DataContext::from_usage_with_runtime(self.usage.as_ref(), &canvas, self.theme_runtime())
+        let mut context =
+            DataContext::from_usage_with_runtime(self.usage.as_ref(), &canvas, runtime);
+        let object = match selection {
+            Selection::Surface(_) => Some(surface),
+            Selection::Object(_, object_index) => surface.children.get(object_index),
+        };
+        if let Some(gap) = object
+            .and_then(|object| theme_engine::evaluate(&object.gap.0, &context).ok())
+            .filter(|value| value.is_finite())
+        {
+            context.insert("this.gap", gap.max(0.0));
+        }
+        context
     }
 
     pub(super) fn scene_tree(&mut self, ui: &mut egui::Ui, read_only: bool) {
@@ -945,7 +569,7 @@ impl StudioApp {
                         &self.theme,
                         surface_index,
                         self.usage.as_ref(),
-                        self.theme_runtime(),
+                        self.theme_runtime_for_surface(surface_index),
                     );
                     let preview_size = egui::vec2(preview_width as f32, preview_height as f32);
                     let roots: Vec<usize> = surface
@@ -1132,7 +756,7 @@ impl StudioApp {
             surface,
             index,
             self.usage.as_ref(),
-            self.theme_runtime(),
+            self.theme_runtime_for_surface(surface),
         )
         .map(|(_, _, width, height)| egui::vec2(width as f32, height as f32))
         .unwrap_or_else(|| egui::vec2(24.0, 24.0));
@@ -1244,13 +868,15 @@ impl StudioApp {
                     .size(16.0)
                     .strong(),
             );
-            crate::ui::components::zoom::zoom_control(
+            if crate::ui::components::zoom::zoom_control(
                 ui,
                 &mut self.zoom,
-                MIN_CANVAS_ZOOM..=MAX_CANVAS_ZOOM,
+                CANVAS_ZOOM_LEVELS,
                 1.0,
                 language,
-            );
+            ) {
+                self.preview_pan = egui::Vec2::ZERO;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.dirty {
                     ui.colored_label(
@@ -1265,63 +891,62 @@ impl StudioApp {
                 index.min(self.theme.surfaces.len().saturating_sub(1))
             }
         };
-        if self.preview_dirty {
-            let runtime = self.theme_runtime();
+        let available = ui.available_size();
+        let runtime = self.theme_runtime_for_surface(surface_index);
+        let (logical_width, logical_height) = theme_engine::resolve_surface_size(
+            &self.theme,
+            surface_index,
+            self.usage.as_ref(),
+            runtime,
+        );
+        let (render_scale, render_width, render_height) = preview_render_scale(
+            logical_width,
+            logical_height,
+            available,
+            ui.ctx().pixels_per_point(),
+        );
+        let render_key = PreviewRenderKey {
+            surface_index,
+            width: render_width,
+            height: render_height,
+        };
+        if self.preview_dirty || self.preview_render_key != Some(render_key) {
             let preview_theme = theme_engine::apply_mouse_action_overrides(
                 &self.theme,
                 &self.preview_mouse_overrides,
             );
-            let should_render = theme_engine::surface_should_render(
-                &preview_theme,
-                surface_index,
-                self.usage.as_ref(),
+            self.preview_generation = self.preview_generation.wrapping_add(1);
+            self.preview_renderer.request(PreviewRenderRequest {
+                generation: self.preview_generation,
+                key: render_key,
+                theme: preview_theme,
+                usage: self.usage.clone(),
                 runtime,
-            );
-            let mut rendered = theme_engine::render_theme_surface_with_runtime(
-                &preview_theme,
-                surface_index,
-                self.usage.as_ref(),
-                runtime,
-            );
-            if !should_render {
-                rendered.pixels.fill(0);
-            }
-            let _render_warnings = &rendered.warnings;
-            let mut rgba = Vec::with_capacity(rendered.pixels.len() * 4);
-            for pixel in rendered.pixels {
-                rgba.extend_from_slice(&[
-                    ((pixel >> 16) & 0xff) as u8,
-                    ((pixel >> 8) & 0xff) as u8,
-                    (pixel & 0xff) as u8,
-                    ((pixel >> 24) & 0xff) as u8,
-                ]);
-            }
+                scale: render_scale,
+            });
+            self.preview_render_key = Some(render_key);
+            self.preview_dirty = false;
+        }
+        if let Some(result) = self.preview_renderer.take_latest().filter(|result| {
+            result.generation == self.preview_generation
+                && self.preview_render_key == Some(result.key)
+        }) {
             let image = egui::ColorImage::from_rgba_premultiplied(
-                [rendered.width as usize, rendered.height as usize],
-                &rgba,
+                [result.width as usize, result.height as usize],
+                &result.rgba,
             );
             match self.preview.as_mut() {
-                Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
+                Some(texture) => texture.set(image, egui::TextureOptions::NEAREST),
                 None => {
                     self.preview = Some(ui.ctx().load_texture(
                         "theme-preview",
                         image,
-                        egui::TextureOptions::LINEAR,
+                        egui::TextureOptions::NEAREST,
                     ))
                 }
             }
-            self.preview_dirty = false;
         }
-        let available = ui.available_size();
-        let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
-        if response.hovered() {
-            let scroll_delta = ui.input(|input| input.smooth_scroll_delta().y);
-            if scroll_delta.abs() > f32::EPSILON {
-                self.zoom = (self.zoom * (scroll_delta * 0.002).exp())
-                    .clamp(MIN_CANVAS_ZOOM, MAX_CANVAS_ZOOM);
-                ui.ctx().request_repaint();
-            }
-        }
+        let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(13, 14, 17));
         let cell = 16.0;
@@ -1345,12 +970,48 @@ impl StudioApp {
             row += 1;
         }
         if let Some(texture) = &self.preview {
-            let texture_size = texture.size_vec2();
-            let fit_factor = (rect.width() / texture_size.x)
-                .min(rect.height() / texture_size.y)
+            let logical_size = egui::vec2(logical_width as f32, logical_height as f32);
+            let fit_factor = (rect.width() / logical_size.x.max(1.0))
+                .min(rect.height() / logical_size.y.max(1.0))
                 .min(1.0);
-            let size = texture_size * fit_factor * self.zoom;
-            let image_rect = egui::Rect::from_center_size(rect.center(), size);
+            let mut size = logical_size * fit_factor * self.zoom;
+            let mut center = clamp_preview_center(rect, size, rect.center() + self.preview_pan);
+
+            if response.hovered() {
+                let scroll_delta = ui.input(|input| {
+                    input
+                        .events
+                        .iter()
+                        .filter_map(|event| match event {
+                            egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                            _ => None,
+                        })
+                        .sum::<f32>()
+                });
+                let previous_zoom = self.zoom;
+                if crate::ui::components::zoom::step_zoom(
+                    &mut self.zoom,
+                    CANVAS_ZOOM_LEVELS,
+                    scroll_delta,
+                ) {
+                    if let Some(pointer) = response.hover_pos() {
+                        center =
+                            preview_center_after_zoom(center, pointer, previous_zoom, self.zoom);
+                    }
+                    size = logical_size * fit_factor * self.zoom;
+                    ui.ctx().request_repaint();
+                }
+            }
+
+            if response.dragged_by(egui::PointerButton::Primary) {
+                center += ui.input(|input| input.pointer.delta());
+            }
+            center = clamp_preview_center(rect, size, center);
+            self.preview_pan = center - rect.center();
+            let image_rect = snap_preview_rect_to_pixels(
+                egui::Rect::from_center_size(center, size),
+                ui.ctx().pixels_per_point(),
+            );
             painter.image(
                 texture.id(),
                 image_rect,
@@ -1358,7 +1019,14 @@ impl StudioApp {
                 egui::Color32::WHITE,
             );
             self.draw_scene_hover_outline(ui, image_rect, surface_index);
-            self.handle_preview_mouse(ui, &response, image_rect, surface_index);
+            if response.dragged_by(egui::PointerButton::Primary) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else {
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+                self.handle_preview_mouse(ui, &response, image_rect, surface_index);
+            }
         }
     }
 
@@ -1373,12 +1041,9 @@ impl StudioApp {
         }
         let theme =
             theme_engine::apply_mouse_action_overrides(&self.theme, &self.preview_mouse_overrides);
-        let (width, height) = theme_engine::resolve_surface_size(
-            &theme,
-            surface_index,
-            self.usage.as_ref(),
-            self.theme_runtime(),
-        );
+        let runtime = self.theme_runtime_for_surface(surface_index);
+        let (width, height) =
+            theme_engine::resolve_surface_size(&theme, surface_index, self.usage.as_ref(), runtime);
         let x = (pointer.x - canvas_rect.left()) as f64 / canvas_rect.width().max(1.0) as f64
             * width as f64;
         let y = (pointer.y - canvas_rect.top()) as f64 / canvas_rect.height().max(1.0) as f64
@@ -1389,7 +1054,7 @@ impl StudioApp {
             x,
             y,
             self.usage.as_ref(),
-            self.theme_runtime(),
+            runtime,
         )
     }
 
@@ -1405,13 +1070,14 @@ impl StudioApp {
         else {
             return false;
         };
+        let runtime = self.theme_runtime_for_surface(surface_index);
         match theme_engine::execute_mouse_actions(
             &self.theme,
             surface_index,
             object_id,
             &source,
             self.usage.as_ref(),
-            self.theme_runtime(),
+            runtime,
             &mut self.preview_mouse_overrides,
         ) {
             Ok(_) => {
@@ -1522,12 +1188,13 @@ impl StudioApp {
             Selection::Object(hovered_surface, object_index)
                 if hovered_surface == surface_index =>
             {
+                let runtime = self.theme_runtime_for_surface(surface_index);
                 let Some((x, y, width, height)) = theme_engine::resolve_object_bounds_with_runtime(
                     &self.theme,
                     surface_index,
                     object_index,
                     self.usage.as_ref(),
-                    self.theme_runtime(),
+                    runtime,
                 ) else {
                     return;
                 };
@@ -1535,7 +1202,7 @@ impl StudioApp {
                     &self.theme,
                     surface_index,
                     self.usage.as_ref(),
-                    self.theme_runtime(),
+                    runtime,
                 );
                 let sx = canvas_rect.width() / canvas_width.max(1) as f32;
                 let sy = canvas_rect.height() / canvas_height.max(1) as f32;
@@ -1813,6 +1480,7 @@ impl StudioApp {
                         label,
                         value,
                         &expression_context,
+                        language,
                     ) {
                         requested_expression = Some(field);
                     }
@@ -1824,6 +1492,7 @@ impl StudioApp {
                     &mut surface.placement.offset_x,
                     &mut surface.placement.offset_x_expression,
                     &expression_context,
+                    language,
                 ) {
                     requested_expression = Some(ExpressionField::PlacementOffsetX);
                 }
@@ -1834,6 +1503,7 @@ impl StudioApp {
                     &mut surface.placement.offset_y,
                     &mut surface.placement.offset_y_expression,
                     &expression_context,
+                    language,
                 ) {
                     requested_expression = Some(ExpressionField::PlacementOffsetY);
                 }
@@ -1843,6 +1513,7 @@ impl StudioApp {
                     language.text("Rotation"),
                     &mut surface.rotation,
                     &expression_context,
+                    language,
                 ) {
                     requested_expression = Some(ExpressionField::ObjectRotation);
                 }
@@ -1864,7 +1535,7 @@ impl StudioApp {
                 _ => scene_object_expression(&surface, field),
             };
             if let Some(draft) = draft {
-                self.expression_helper = Some(ExpressionHelperState::new(
+                self.helper = Some(HelperSession::expression(
                     Selection::Surface(index),
                     field,
                     draft,
@@ -1877,7 +1548,7 @@ impl StudioApp {
                 .as_ref()
                 .map(|events| events.handler(field.kind()).to_string())
                 .unwrap_or_default();
-            self.action_helper = Some(ActionHelperState::new(
+            self.helper = Some(HelperSession::mouse_action(
                 Selection::Surface(index),
                 field,
                 draft,
@@ -1885,8 +1556,8 @@ impl StudioApp {
         }
         if requested_text_template {
             if let SceneContent::Text { template, .. } = &surface.content {
-                self.text_template_helper = Some(TextTemplateHelperState::for_theme(
-                    Selection::Surface(index),
+                self.helper = Some(HelperSession::text(
+                    TextTemplateHelperTarget::Theme(Selection::Surface(index)),
                     template.clone(),
                 ));
             }
@@ -2040,6 +1711,7 @@ impl StudioApp {
                         label,
                         value,
                         &expression_context,
+                        language,
                     ) {
                         requested_expression = Some(field);
                     }
@@ -2067,6 +1739,7 @@ impl StudioApp {
                         label,
                         value,
                         &expression_context,
+                        language,
                     ) {
                         requested_expression = Some(field);
                     }
@@ -2076,7 +1749,7 @@ impl StudioApp {
 
         if let Some(field) = requested_expression {
             if let Some(draft) = scene_object_expression(&object, field) {
-                self.expression_helper = Some(ExpressionHelperState::new(
+                self.helper = Some(HelperSession::expression(
                     Selection::Object(surface_index, object_index),
                     field,
                     draft,
@@ -2089,7 +1762,7 @@ impl StudioApp {
                 .as_ref()
                 .map(|events| events.handler(field.kind()).to_string())
                 .unwrap_or_default();
-            self.action_helper = Some(ActionHelperState::new(
+            self.helper = Some(HelperSession::mouse_action(
                 Selection::Object(surface_index, object_index),
                 field,
                 draft,
@@ -2097,8 +1770,8 @@ impl StudioApp {
         }
         if requested_text_template {
             if let SceneContent::Text { template, .. } = &object.content {
-                self.text_template_helper = Some(TextTemplateHelperState::for_theme(
-                    Selection::Object(surface_index, object_index),
+                self.helper = Some(HelperSession::text(
+                    TextTemplateHelperTarget::Theme(Selection::Object(surface_index, object_index)),
                     template.clone(),
                 ));
             }
@@ -2480,5 +2153,120 @@ impl StudioApp {
             ),
         );
         self.selection = Selection::Surface(index);
+    }
+}
+
+fn preview_center_after_zoom(
+    center: egui::Pos2,
+    pointer: egui::Pos2,
+    previous_zoom: f32,
+    next_zoom: f32,
+) -> egui::Pos2 {
+    if !previous_zoom.is_finite() || previous_zoom <= 0.0 || !next_zoom.is_finite() {
+        return center;
+    }
+    pointer + (center - pointer) * (next_zoom / previous_zoom)
+}
+
+fn snap_preview_rect_to_pixels(rect: egui::Rect, pixels_per_point: f32) -> egui::Rect {
+    let pixels_per_point = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    let snapped_min = egui::pos2(
+        (rect.min.x * pixels_per_point).round() / pixels_per_point,
+        (rect.min.y * pixels_per_point).round() / pixels_per_point,
+    );
+    egui::Rect::from_min_size(snapped_min, rect.size())
+}
+
+fn clamp_preview_center(
+    viewport: egui::Rect,
+    image_size: egui::Vec2,
+    center: egui::Pos2,
+) -> egui::Pos2 {
+    const MINIMUM_VISIBLE_POINTS: f32 = 32.0;
+
+    fn clamp_axis(start: f32, end: f32, image_length: f32, value: f32) -> f32 {
+        let half = image_length.max(0.0) / 2.0;
+        let (minimum, maximum) = if image_length <= end - start {
+            (start + half, end - half)
+        } else {
+            let visible = MINIMUM_VISIBLE_POINTS
+                .min(image_length)
+                .min((end - start).max(0.0));
+            (start + visible - half, end - visible + half)
+        };
+        value.clamp(minimum, maximum)
+    }
+
+    egui::pos2(
+        clamp_axis(viewport.left(), viewport.right(), image_size.x, center.x),
+        clamp_axis(viewport.top(), viewport.bottom(), image_size.y, center.y),
+    )
+}
+
+#[cfg(test)]
+mod preview_navigation_tests {
+    use super::*;
+
+    #[test]
+    fn zoom_keeps_the_point_under_the_pointer_stationary() {
+        let center = egui::pos2(100.0, 80.0);
+        let pointer = egui::pos2(60.0, 50.0);
+        let next = preview_center_after_zoom(center, pointer, 2.0, 4.0);
+
+        assert_eq!(next, egui::pos2(140.0, 110.0));
+        assert_eq!((pointer - center) / 2.0, (pointer - next) / 4.0);
+    }
+
+    #[test]
+    fn small_previews_remain_fully_inside_the_viewport() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(200.0, 100.0));
+        let size = egui::vec2(80.0, 40.0);
+
+        assert_eq!(
+            clamp_preview_center(viewport, size, egui::pos2(-100.0, 500.0)),
+            egui::pos2(50.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn oversized_previews_always_leave_a_grabbable_area_visible() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 100.0));
+        let size = egui::vec2(300.0, 160.0);
+
+        assert_eq!(
+            clamp_preview_center(viewport, size, egui::pos2(-500.0, -500.0)),
+            egui::pos2(-118.0, -48.0)
+        );
+        assert_eq!(
+            clamp_preview_center(viewport, size, egui::pos2(500.0, 500.0)),
+            egui::pos2(318.0, 148.0)
+        );
+    }
+
+    #[test]
+    fn preview_rect_snaps_odd_height_centering_to_physical_pixels() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 101.0));
+        let centered = egui::Rect::from_center_size(viewport.center(), egui::vec2(162.0, 44.0));
+
+        assert_eq!(centered.min, egui::pos2(19.0, 28.5));
+        let snapped = snap_preview_rect_to_pixels(centered, 1.0);
+
+        assert_eq!(snapped.min, egui::pos2(19.0, 29.0));
+        assert_eq!(snapped.size(), egui::vec2(162.0, 44.0));
+    }
+
+    #[test]
+    fn preview_rect_snaps_to_the_active_dpi_pixel_grid() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.25, 20.25), egui::vec2(81.0, 22.0));
+        let snapped = snap_preview_rect_to_pixels(rect, 2.0);
+
+        assert_eq!(snapped.min, egui::pos2(10.5, 20.5));
+        assert_eq!(snapped.size(), rect.size());
+        assert_eq!(snapped.min.x * 2.0, (snapped.min.x * 2.0).round());
+        assert_eq!(snapped.min.y * 2.0, (snapped.min.y * 2.0).round());
     }
 }

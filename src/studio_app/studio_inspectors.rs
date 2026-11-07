@@ -44,6 +44,7 @@ pub(super) fn text_template_editor_control(
     template: &mut String,
     context: &DataContext,
     width: f32,
+    language: LanguageId,
 ) -> bool {
     let has_expression = template_has_expression(template);
     let preview = if has_expression {
@@ -58,7 +59,7 @@ pub(super) fn text_template_editor_control(
         &preview,
         width,
         has_expression,
-        "text helper",
+        language,
         egui::Align::Min,
     );
     if action.remove {
@@ -79,6 +80,7 @@ pub(super) fn numeric_expression_control(
     label: &str,
     value: &mut Expression,
     context: &DataContext,
+    language: LanguageId,
 ) -> bool {
     let is_simple = value
         .0
@@ -109,7 +111,7 @@ pub(super) fn numeric_expression_control(
                 id,
                 available_width,
                 preview.as_deref().map(|value| (value, egui::Align::Center)),
-                "an expression",
+                language,
                 |ui, width| {
                     let mut number = value.0.trim().parse::<f64>().unwrap_or_default();
                     if NumberField::new(&mut number).show(ui, width).changed() {
@@ -248,7 +250,7 @@ pub(super) fn expression_control(
                         },
                     )
                 }),
-                language.text("an expression"),
+                language,
                 |ui, width| match kind {
                     ExpressionControlKind::Boolean => {
                         let mut enabled =
@@ -319,6 +321,7 @@ pub(super) fn placement_offset_expression_control(
     value: &mut i32,
     expression: &mut Option<Expression>,
     context: &DataContext,
+    language: LanguageId,
 ) -> bool {
     let mut edit_clicked = false;
     let preview = expression.as_ref().map(|formula| {
@@ -336,7 +339,7 @@ pub(super) fn placement_offset_expression_control(
                 id,
                 available_width,
                 preview.as_deref().map(|value| (value, egui::Align::Center)),
-                "an expression",
+                language,
                 |ui, width| {
                     NumberField::new(value).show(ui, width);
                 },
@@ -364,6 +367,7 @@ pub(super) fn segment_count_expression_control(
     value: &mut u16,
     expression: &mut Option<Expression>,
     context: &DataContext,
+    language: LanguageId,
 ) -> bool {
     let mut edit_clicked = false;
     let preview = expression.as_ref().map(|formula| {
@@ -381,7 +385,7 @@ pub(super) fn segment_count_expression_control(
                 id,
                 available_width,
                 preview.as_deref().map(|value| (value, egui::Align::Center)),
-                "an expression",
+                language,
                 |ui, width| {
                     NumberField::new(value).range(0..=100).show(ui, width);
                 },
@@ -402,26 +406,10 @@ pub(super) fn segment_count_expression_control(
     edit_clicked
 }
 
-pub(super) fn paint_control(
-    ui: &mut egui::Ui,
-    label: &str,
-    paint: &mut Paint,
-    context: &DataContext,
-) {
+pub(super) fn paint_control(ui: &mut egui::Ui, label: &str, paint: &mut Paint) {
     labeled(ui, label, |ui| {
         let width = inspector_control_width(ui);
         crate::ui::components::color_picker::color_string_field(ui, &mut paint.color, width);
-        let accounts = context.account_names();
-        if !accounts.is_empty() {
-            ui.menu_button("Codex", |ui| {
-                for (key, name) in &accounts {
-                    if ui.button(name).clicked() {
-                        paint.color = format!("{{{key}.color}}");
-                        ui.close();
-                    }
-                }
-            });
-        }
     });
 }
 
@@ -640,18 +628,17 @@ pub(super) fn appearance_inspector(
     }
     match &mut object.background {
         LayerBackground::None => {}
-        LayerBackground::Colour { colour } => {
-            paint_control(ui, language.text("Colour"), colour, context)
-        }
+        LayerBackground::Colour { colour } => paint_control(ui, language.text("Colour"), colour),
         LayerBackground::Gradient { start, end, angle } => {
-            paint_control(ui, language.text("Start"), start, context);
-            paint_control(ui, language.text("End"), end, context);
+            paint_control(ui, language.text("Start"), start);
+            paint_control(ui, language.text("End"), end);
             if numeric_expression_control(
                 ui,
                 id.with("background-gradient-angle"),
                 language.text("Angle"),
                 angle,
                 context,
+                language,
             ) {
                 requested_expression = Some(ExpressionField::BackgroundGradientAngle);
             }
@@ -706,18 +693,14 @@ pub(super) fn appearance_inspector(
         });
     }
     if let Some(border) = &mut object.border {
-        paint_control(
-            ui,
-            language.text("Border colour"),
-            &mut border.color,
-            context,
-        );
+        paint_control(ui, language.text("Border colour"), &mut border.color);
         if numeric_expression_control(
             ui,
             id.with("border-width"),
             language.text("Border width"),
             &mut border.width,
             context,
+            language,
         ) {
             requested_expression = Some(ExpressionField::ObjectBorderWidth);
         }
@@ -728,6 +711,7 @@ pub(super) fn appearance_inspector(
         language.text("Corner radius"),
         &mut object.corner_radius,
         context,
+        language,
     ) {
         requested_expression = Some(ExpressionField::ObjectCornerRadius);
     }
@@ -764,7 +748,7 @@ pub(super) fn mouse_events_inspector(
                 preview,
                 inspector_control_width(ui),
                 !value.trim().is_empty(),
-                language.text("action helper"),
+                language,
                 egui::Align::Min,
             );
             if action.remove {
@@ -882,6 +866,7 @@ pub(super) fn layer_properties_inspector(
             language.text("Gap"),
             &mut object.gap,
             context,
+            language,
         ) {
             requested = Some(LayerInspectorRequest::Expression(ExpressionField::ChildGap));
         }
@@ -917,6 +902,7 @@ pub(super) fn content_inspector(
                     template,
                     context,
                     width,
+                    language,
                 ) {
                     requested = Some(LayerInspectorRequest::TextTemplate);
                 }
@@ -938,6 +924,7 @@ pub(super) fn content_inspector(
                 language.text("Size"),
                 font_size,
                 context,
+                language,
             ) {
                 requested = Some(LayerInspectorRequest::Expression(
                     ExpressionField::TextFontSize,
@@ -984,6 +971,7 @@ pub(super) fn content_inspector(
                 language.text("Edge contrast"),
                 contrast,
                 context,
+                language,
             ) {
                 requested = Some(LayerInspectorRequest::Expression(
                     ExpressionField::TextFontContrast,
@@ -999,7 +987,7 @@ pub(super) fn content_inspector(
                         }
                     });
             });
-            paint_control(ui, language.text("Colour"), color, context);
+            paint_control(ui, language.text("Colour"), color);
         }
         SceneContent::Progress {
             value,
@@ -1017,6 +1005,7 @@ pub(super) fn content_inspector(
                 language.text("Value"),
                 value,
                 context,
+                language,
             ) {
                 requested = Some(LayerInspectorRequest::Expression(
                     ExpressionField::ProgressValue,
@@ -1042,14 +1031,15 @@ pub(super) fn content_inspector(
                         }
                     });
             });
-            paint_control(ui, language.text("Fill"), fill, context);
-            paint_control(ui, language.text("Track"), track, context);
+            paint_control(ui, language.text("Fill"), fill);
+            paint_control(ui, language.text("Track"), track);
             if numeric_expression_control(
                 ui,
                 id.with("radius"),
                 language.text("Radius"),
                 corner_radius,
                 context,
+                language,
             ) {
                 requested = Some(LayerInspectorRequest::Expression(
                     ExpressionField::ProgressCornerRadius,
@@ -1062,6 +1052,7 @@ pub(super) fn content_inspector(
                 segments,
                 segments_expression,
                 context,
+                language,
             ) {
                 requested = Some(LayerInspectorRequest::Expression(
                     ExpressionField::ProgressSegments,
@@ -1073,6 +1064,7 @@ pub(super) fn content_inspector(
                 language.text("Segment gap"),
                 segment_gap,
                 context,
+                language,
             ) {
                 requested = Some(LayerInspectorRequest::Expression(
                     ExpressionField::ProgressSegmentGap,

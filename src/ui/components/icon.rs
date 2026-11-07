@@ -5,7 +5,13 @@ use crate::ui::theme::{accent, accent_hover_border};
 use crate::ui::tokens::{CONTROL_CORNER_RADIUS, CONTROL_HEIGHT};
 
 pub(crate) fn icon_text(icon: LucideIcon, size: f32) -> egui::RichText {
-    egui::RichText::new(icon.unicode().to_string())
+    glyph_text(icon.unicode(), size)
+}
+
+/// Renders a bare codepoint from the `lucide` family, which also carries the
+/// brand marks in [`crate::ui::theme`]. Prefer [`icon_text`] for Lucide icons.
+pub(crate) fn glyph_text(glyph: char, size: f32) -> egui::RichText {
+    egui::RichText::new(glyph.to_string())
         .family(egui::FontFamily::Name("lucide".into()))
         .size(size)
 }
@@ -132,7 +138,7 @@ mod tests {
         let context = egui::Context::default();
         crate::ui::theme::configure_style(&context, crate::localization::LanguageId::English);
         let mut heights = [0.0; 6];
-        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
             ui.horizontal(|ui| {
                 heights[0] = Dropdown::from_id_salt("probe")
                     .selected_text("Theme")
@@ -157,6 +163,7 @@ mod tests {
                     .height();
             });
         });
+        output.textures_delta.clear();
         assert_eq!(heights, [CONTROL_HEIGHT; 6]);
     }
 }

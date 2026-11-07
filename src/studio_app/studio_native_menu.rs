@@ -94,7 +94,7 @@ pub(super) struct NativeMenuThemeColors {
 pub(super) fn native_menu_theme_colors() -> Option<NativeMenuThemeColors> {
     unsafe {
         let class = native_interop::wide_str("Menu");
-        let theme = OpenThemeData(HWND::default(), PCWSTR::from_raw(class.as_ptr()));
+        let theme = OpenThemeData(None, PCWSTR::from_raw(class.as_ptr()));
         if theme.is_invalid() {
             return None;
         }
@@ -221,6 +221,7 @@ pub(super) fn native_context_menu_width(
 ) -> f32 {
     let label_width = items
         .iter()
+        .filter(|item| item.should_render(context))
         .filter(|item| !matches!(&item.kind, ContextMenuItemKind::Separator))
         .map(|item| context_menu::rendered_label(language, &item.label, context))
         .map(|label| {
@@ -265,6 +266,9 @@ pub(super) fn preview_context_menu_items(
         state.appearance,
     ));
     for item in items {
+        if !item.should_render(state.context) {
+            continue;
+        }
         match &item.kind {
             ContextMenuItemKind::Separator => {
                 let (rect, _) = ui.allocate_exact_size(
@@ -367,7 +371,7 @@ pub(super) fn preview_context_menu_submenu<R>(
     let widget_id = ui.next_auto_id();
     let submenu_id = SubMenu::id_from_widget_id(widget_id);
     let preview_state_id = find_menu_root(ui)
-        .id
+        .scope_id
         .with("context-menu-preview-open-submenu");
     if !open_submenu_state_ids.borrow().contains(&preview_state_id) {
         open_submenu_state_ids.borrow_mut().push(preview_state_id);
@@ -570,6 +574,7 @@ pub(super) fn context_menu_preview_action_checked(
         }
         ContextMenuAction::ToggleProvider { provider } => settings.provider_enabled(*provider),
         ContextMenuAction::ToggleStartup => startup_enabled,
+        ContextMenuAction::ToggleTaskbarLock => settings.lock_taskbar,
         ContextMenuAction::ToggleWidget => theme
             .surfaces
             .iter()

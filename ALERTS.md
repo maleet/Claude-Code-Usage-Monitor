@@ -1,97 +1,91 @@
-# Usage threshold notifications
+# Usage alerts on 2.23.0
 
-Based on upstream main commit 8fe1659 (package version 2.3.2).
+This custom build is based on CodeZeno's exact v2.23.0 release,
+commit dea72c9d48cfe1ba4c5ebd0265e1fa005e7d2053. It adds usage threshold
+notifications while retaining upstream's taskbar collision handling and account model.
 
-## Behaviour
+## Automatic floating when the taskbar fills
 
-- Settings > Usage alerts enables native Windows notifications (enabled by default).
-- Default thresholds: 80%, 90%, 95%. Each checkbox can be changed separately.
-- Session and weekly/long-term alerts have independent switches.
-- Alerts apply to enabled providers and visible Codex accounts independently.
-- Only fresh successful usage polls are evaluated; failed Codex accounts are skipped.
-- Starting above a threshold sends a warning on the first successful refresh.
-- A jump across several thresholds sends one warning for the highest crossed threshold.
-- Simultaneous warnings are combined to avoid replacing each other's Windows balloons.
-- Sent thresholds are saved separately from settings and remain consumed after restart.
-- A new reset timestamp rearms that window. Expired and older windows are ignored.
-- Providers without reset timestamps rearm when usage falls below all selected thresholds.
-- If a provider stops returning a previously known timestamp, the previous window identity is retained.
-- The Send test notification button does not consume real thresholds.
-- The existing authentication-error notifications remain unchanged.
+Leave Settings > Display > Lock in taskbar off (the Floating state).
+Upstream detects overlapping app buttons or an authored layout that cannot fit,
+moves the widget into a floating card, and restores it when the saved dock position
+has enough room. Return clearance prevents repeated docking and undocking.
 
-Notifications use the app's existing Windows balloon mechanism. Windows controls their
-visibility and sound; acceptance by Explorer does not prove that a banner was seen.
-Do not disturb may suppress banners. The app must be running. Set General > Update
-frequency to Every minute for timely warnings; the existing 15-minute default is unchanged.
-New alert labels/messages use English and fall back to English in other UI languages.
+Intentional floating placements stay floating. Enabling Lock in taskbar suppresses
+automatic floating caused by application buttons. Existing themes and placements follow
+the 2.23.0 migration and positioning rules; the alert feature does not change them.
 
-## Configuration
+## Usage notifications
 
-The existing settings file gains a backwards-compatible `usage_alerts` object:
+Settings > Usage alerts controls:
 
-```json
-{
-  "usage_alerts": {
-    "enabled": true,
-    "session": true,
-    "weekly": true,
-    "thresholds": [80, 90, 95]
-  }
-}
-```
+- Desktop notifications, enabled by default.
+- Session and weekly/long-term limits independently.
+- Individual 80%, 90% and 95% threshold checkboxes.
+- A Send test notification button that does not consume real thresholds.
 
-Advanced thresholds from 1 to 100 can be entered in JSON while the monitor and dashboard
-are closed. Values are sorted, deduplicated and invalid values removed on load/save.
-An empty list disables threshold alerts. Alert history is in `usage-alert-state.json`
-beside the existing settings file. It stores window identifiers and sent percentages,
-never credentials. Persistence/notification failures are recorded when diagnostic logging
-is enabled. If Windows rejects a balloon, the next successful poll retries it. If saving
-history fails, in-memory deduplication still works but a restart can repeat a warning.
+Set General > Update frequency to 1 minute for timely warnings. Alerts are evaluated
+after successful polls while the monitor is running. They use consumed quota, even if
+the widget is configured to display remaining quota.
 
-## Build and validate on Windows
+Each enabled account has independent alert history. Failed accounts, stale readings,
+unavailable windows and expired windows cannot trigger alerts. A jump across several
+thresholds sends one warning for the highest crossed threshold. Simultaneous warnings
+are combined into one native Windows notification.
 
-Use the upstream Rust/MSVC setup (Rust stable, Visual Studio C++ Build Tools and Windows SDK).
-Run `cargo test alerts::tests` to execute the focused alert tests; this compiles the
-Windows app and its existing build-time font and resource tooling. Then use
-`cargo build --release` to produce the executable in the existing target/release directory.
+History survives restarts. A new reset timestamp rearms the window; providers without
+reset timestamps rearm below all selected thresholds. Existing default Claude and local
+Codex histories migrate from the previous custom build. Custom account configuration
+uses the upstream 2.23.0 credential-profile model.
 
-Do not replace the installed version until the build and notification smoke test pass.
-Close the existing monitor before launching a locally built executable. Open Settings >
-Usage alerts > Send test notification, check both switches and the selected thresholds,
-and use Refresh now to check any already-high live usage. Restart to check deduplication.
-The portable app shares existing settings with the installed app. Accepting an upstream
-update from the custom build can replace it and remove this feature until upstream
-includes the change. Automatic update checks themselves do not install an update.
-If Start with Windows still points at the installed upstream executable, switch it off
-and back on from the custom build to register the custom executable's location. Keep
-the custom executable in its intended permanent location before doing this.
+Windows controls banner visibility and sound, including Do not disturb. Explorer accepting
+a notification is not proof that a banner was displayed. Rejected notifications retry on
+the next poll. History-write failures preserve in-memory deduplication and are logged
+when diagnostics are enabled, but a restart can repeat a warning after a write failure.
+New specialist alert labels use English in locales without a reviewed translation.
 
-## Validation status
+## Saved configuration
 
-All 171 Rust tests passed, including eight focused alert tests, two compiled-resource
-regression tests and a settings migration
-regression test. Tests cover thresholds, startup above limits, persistence round trips,
-resets, stale windows, missing reset timestamps, invalid inputs, disabled alerts,
-independent usage windows and separate Codex accounts. Changed Rust files pass rustfmt.
+The existing settings file keeps the backwards-compatible usage_alerts object:
 
-Local validation uses isolated Rust 1.99.1 (`x86_64-pc-windows-gnu`) with LLVM-MinGW
-20261104 MSVCRT. GCC runtime archives come from the same Rust toolchain, in a separate
-library search directory so the MinGW CRT versions are not mixed. Cargo uses the unchanged
-lock file. No new project dependencies were added. The existing rendering test expects a
-manifest-local target directory for preview PNGs, even when CARGO_TARGET_DIR is redirected;
-creating that directory resolves its initial missing-directory failure.
+    "usage_alerts": {
+      "enabled": true,
+      "session": true,
+      "weekly": true,
+      "thresholds": [80, 90, 95]
+    }
 
-The initial GNU/LLD release omitted the compiled Windows resources because the linker
-discarded winres's unreferenced static archive. Without the compatibility manifest,
-UpdateLayeredWindow failed with error 0x80070057 for the taskbar child window. GNU builds
-now link resource.o directly. Regression tests load the actual embedded manifest and
-application icons from the compiled test executable; both tests fail before the fix
-and pass afterwards. The release executable must also contain the seven icon, version,
-and manifest resources.
+Advanced JSON thresholds from 1 to 100 are supported; values are sorted and deduplicated.
+An empty list disables threshold alerts. History is stored separately in
+usage-alert-state.json beside settings and contains no credentials.
 
-The corrected release contains all seven resources. It was launched with the existing
-user configuration: polling succeeded and the former UpdateLayeredWindow error no longer
-appeared. The settings UI was visually inspected and Windows accepted a test notification.
-The test button resynchronises tray icons before sending, including in --no-poll mode.
-Explorer accepting a notification does not prove the banner was displayed; Windows
-notification settings still control banner visibility and sound.
+## Build and checks
+
+Use the upstream Windows development setup in CONTRIBUTING.md. The Rust 1.95.0 project
+toolchain and the 2.23.0 dependency lock file remain unchanged. No dependencies were added
+for alerts. Run cargo fmt --all -- --check, cargo test --locked, and
+cargo build --locked --release.
+
+Local validation uses isolated Rust 1.99.1 GNU with LLVM-MinGW 20261104 MSVCRT.
+The upstream winresource version links the Windows resource object directly, so the
+older winres-specific workaround is unnecessary. Regression tests load the embedded
+compatibility manifest and application icons from the compiled executable.
+
+Keep the custom EXE in its intended permanent location. If Start with Windows still points
+to a different executable, switch it off and on from the custom build. Accepting an
+upstream update can replace the custom alert feature; automatic update checks alone do
+not install an update.
+
+## Validation for this port
+
+- Formatting check passed.
+- Full suite: 632 passed, 6 upstream integration tests ignored by default.
+- The ignored live taskbar occupancy test was also run separately and passed.
+- Release EXE reports 2.23.0 and retains all seven Windows resources.
+- Live desktop: the existing full taskbar triggered automatic floating after startup.
+- Live polling succeeded and Windows accepted the test notification from the dashboard.
+- Return-to-taskbar clearance and capacity handling passed the upstream regression tests.
+
+The other five ignored checks require external HTTPS/WinGet services or an authenticated
+Claude desktop integration and were not needed to validate this port. Banner visibility
+and sound remain controlled by Windows notification settings.

@@ -1,171 +1,343 @@
-//! Account metadata is public state; credentials live only in the encrypted vault.
-use crate::models::UsageData;
+//! Named credential sources. Settings contain paths and labels, never tokens.
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
-pub type AccountId = String;
+use crate::providers::ProviderId;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AccountSource {
-    LocalCli,
-    OAuth,
+/// Stable non-secret key for source paths and file metadata (not token contents).
+pub fn fingerprint(value: &str) -> String {
+    let hash = value.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    format!("{hash:016x}")
+}
+
+pub fn file_signature(path: &Path) -> String {
+    let metadata = std::fs::metadata(path).ok();
+    fingerprint(&format!(
+        "{}|{:?}|{:?}",
+        source_key(path),
+        metadata.as_ref().map(|m| m.len()),
+        metadata.and_then(|m| m.modified().ok())
+    ))
+}
+
+pub fn source_key(path: &Path) -> String {
+    match std::fs::canonicalize(path) {
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err(_) => path.to_string_lossy().to_lowercase(),
+    }
+}
+
+pub fn default_credential_path(provider: ProviderId) -> Option<PathBuf> {
+    let directory = environment_directory(provider).or_else(|| {
+        crate::known_folders::home_dir().map(|home| {
+            home.join(if provider == ProviderId::Claude {
+                ".claude"
+            } else {
+                ".codex"
+            })
+        })
+    })?;
+    Some(directory.join(if provider == ProviderId::Claude {
+        ".credentials.json"
+    } else {
+        "auth.json"
+    }))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Account {
-    pub id: AccountId,
+#[serde(default)]
+pub struct AccountProfile {
+    pub id: String,
     pub name: String,
-    pub color: String,
-    pub visible: bool,
-    pub source: AccountSource,
-    #[serde(default)]
-    pub identity: String,
-    #[serde(default)]
-    pub subject: String,
-    #[serde(default)]
-    pub workspace: String,
+    pub config_dir: String,
+    pub credentials_path: String,
+    pub enabled: bool,
 }
 
-pub fn legacy_accounts() -> Vec<Account> {
-    vec![Account {
-        id: "codex_local".into(),
-        name: "Codex – local CLI".into(),
-        color: "#4D9FFFFF".into(),
-        visible: true,
-        source: AccountSource::LocalCli,
-        identity: String::new(),
-        subject: String::new(),
-        workspace: String::new(),
-    }]
-}
-
-impl Account {
-    pub fn new(index: usize) -> Self {
-        use rand::RngCore;
-        let mut bytes = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+impl Default for AccountProfile {
+    fn default() -> Self {
         Self {
-            id: format!(
-                "codex_{}",
-                bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
-            ),
-            name: format!("Codex {}", index + 1),
-            color: ["#4D9FFFFF", "#B18AFFFF", "#35C9A0FF", "#F0A44BFF"][index % 4].into(),
-            visible: true,
-            source: AccountSource::OAuth,
-            identity: String::new(),
-            subject: String::new(),
-            workspace: String::new(),
+            id: "default".into(),
+            name: "Default".into(),
+            config_dir: String::new(),
+            credentials_path: String::new(),
+            enabled: true,
         }
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct AccountUsage {
-    pub usage: Option<UsageData>,
-    pub updated_unix: u64,
-    pub error: Option<String>,
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderAccounts {
+    pub profiles: Vec<AccountProfile>,
+    pub selected: String,
+    /// Retain retired IDs so existing theme bindings never target a new account.
+    pub used_ids: std::collections::BTreeSet<String>,
 }
 
-pub fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-/// Retain only configured accounts, and seed the old single-provider cache once.
-pub fn reconcile(data: &mut crate::models::AppUsageData, accounts: &[Account]) {
-    data.accounts
-        .retain(|id, _| accounts.iter().any(|account| &account.id == id));
-    let legacy = data.get(crate::providers::ProviderId::Codex).cloned();
-    for account in accounts {
-        data.accounts
-            .entry(account.id.clone())
-            .or_insert_with(|| AccountUsage {
-                usage: if account.source == AccountSource::LocalCli {
-                    legacy.clone()
-                } else {
-                    None
-                },
-                ..Default::default()
-            });
+impl Default for ProviderAccounts {
+    fn default() -> Self {
+        Self {
+            profiles: vec![AccountProfile::default()],
+            selected: "default".into(),
+            used_ids: ["default".into()].into(),
+        }
     }
-    data.account_order = accounts.to_vec();
-    data.refresh_codex_alias();
 }
 
-pub fn identity_match(accounts: &[Account], incoming: &Account) -> Option<usize> {
-    accounts.iter().position(|account| {
-        account.source == AccountSource::OAuth
-            && account.subject == incoming.subject
-            && account.workspace == incoming.workspace
+impl ProviderAccounts {
+    pub fn selected(&self) -> Option<&AccountProfile> {
+        self.profiles
+            .iter()
+            .find(|profile| profile.enabled && profile.id == self.selected)
+            .or_else(|| self.profiles.iter().find(|profile| profile.enabled))
+    }
+
+    pub fn add(&mut self) {
+        self.normalize();
+        let (id, number) = self.allocate_id();
+        self.profiles.push(AccountProfile {
+            id,
+            name: format!("Account {number}"),
+            enabled: false,
+            ..Default::default()
+        });
+    }
+
+    fn allocate_id(&mut self) -> (String, usize) {
+        let mut number = 1;
+        while self.used_ids.contains(&format!("account_{number}")) {
+            number += 1;
+        }
+        let id = format!("account_{number}");
+        self.used_ids.insert(id.clone());
+        (id, number)
+    }
+
+    pub fn normalize(&mut self) {
+        let selected_index = self
+            .profiles
+            .iter()
+            .position(|profile| profile.id == self.selected)
+            .or_else(|| {
+                self.profiles
+                    .iter()
+                    .position(|profile| profile.id.eq_ignore_ascii_case(&self.selected))
+            });
+        self.used_ids = std::mem::take(&mut self.used_ids)
+            .into_iter()
+            .map(|id| id.to_ascii_lowercase())
+            .collect();
+        // Reserve every existing ID before allocating replacements. An earlier
+        // invalid profile must not steal a later valid profile's binding.
+        self.used_ids.extend(
+            self.profiles
+                .iter()
+                .map(|profile| profile.id.to_ascii_lowercase()),
+        );
+        let mut seen = std::collections::HashSet::new();
+        for index in 0..self.profiles.len() {
+            let profile = &self.profiles[index];
+            if profile.id.is_empty()
+                || !profile
+                    .id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                || !seen.insert(profile.id.to_ascii_lowercase())
+            {
+                let (id, _) = self.allocate_id();
+                seen.insert(id.to_ascii_lowercase());
+                self.profiles[index].id = id;
+            }
+            let profile = &mut self.profiles[index];
+            if profile.name.trim().is_empty() {
+                profile.name = profile.id.clone();
+            }
+        }
+        if let Some(index) = selected_index {
+            self.selected = self.profiles[index].id.clone();
+        }
+        self.selected = self.selected().map(|p| p.id.clone()).unwrap_or_default();
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccountSettings {
+    pub claude: ProviderAccounts,
+    pub codex: ProviderAccounts,
+}
+
+impl AccountSettings {
+    pub fn get(&self, provider: ProviderId) -> Option<&ProviderAccounts> {
+        match provider {
+            ProviderId::Claude => Some(&self.claude),
+            ProviderId::Codex => Some(&self.codex),
+            _ => None,
+        }
+    }
+}
+
+pub fn environment_directory(provider: ProviderId) -> Option<PathBuf> {
+    let variable = match provider {
+        ProviderId::Claude => "CLAUDE_CONFIG_DIR",
+        ProviderId::Codex => "CODEX_HOME",
+        _ => return None,
+    };
+    environment_directory_value(std::env::var_os(variable))
+}
+
+fn environment_directory_value(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).and_then(|value| {
+        let path = Path::new(&value);
+        expand_path(path).or_else(|| std::env::current_dir().ok().map(|cwd| cwd.join(path)))
     })
 }
 
-pub type AccountUsages = BTreeMap<AccountId, AccountUsage>;
+pub fn expand_path(path: &Path) -> Option<PathBuf> {
+    let text = path.to_string_lossy();
+    if text == "~" {
+        return crate::known_folders::home_dir();
+    }
+    if let Some(tail) = text.strip_prefix("~/").or_else(|| text.strip_prefix("~\\")) {
+        return Some(crate::known_folders::home_dir()?.join(tail));
+    }
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        // Settings must behave the same when launched from a terminal or at login.
+        None
+    }
+}
+
+impl AccountProfile {
+    pub fn same_source(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.config_dir == other.config_dir
+            && self.credentials_path == other.credentials_path
+    }
+
+    pub fn credential_path(&self, provider: ProviderId) -> Result<Option<PathBuf>, String> {
+        if !self.credentials_path.trim().is_empty() {
+            return expand_path(Path::new(self.credentials_path.trim()))
+                .map(Some)
+                .ok_or_else(|| "Use an absolute credentials file path or ~/path".into());
+        }
+        let directory = if !self.config_dir.trim().is_empty() {
+            expand_path(Path::new(self.config_dir.trim()))
+                .ok_or("Use an absolute config directory or ~/path")?
+        } else if self.id == "default" {
+            return Ok(None);
+        } else {
+            return Err(
+                "Set a config directory or credentials file before enabling this account".into(),
+            );
+        };
+        Ok(Some(directory.join(match provider {
+            ProviderId::Claude => ".credentials.json",
+            ProviderId::Codex => "auth.json",
+            _ => return Err("This provider does not support account profiles".into()),
+        })))
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{models::AppUsageData, providers::ProviderId};
 
     #[test]
-    fn migration_and_removal_do_not_cross_account_data() {
-        let mut data = AppUsageData::default();
-        let mut usage = UsageData::default();
-        usage.session.percentage = 41.0;
-        data.insert(ProviderId::Codex, usage);
-        let mut accounts = legacy_accounts();
-        accounts.push(Account::new(0));
-        reconcile(&mut data, &accounts);
+    fn deleted_ids_are_not_reused_after_saving_and_restarting() {
+        let mut accounts = ProviderAccounts::default();
+        accounts.add();
+        let removed_id = accounts.profiles.pop().unwrap().id;
+        let json = serde_json::to_string(&accounts).unwrap();
+        let mut reloaded: ProviderAccounts = serde_json::from_str(&json).unwrap();
+        reloaded.add();
+        assert_ne!(reloaded.profiles.last().unwrap().id, removed_id);
+        assert!(reloaded.used_ids.contains(&removed_id));
+    }
+
+    #[test]
+    fn legacy_ids_are_reserved_and_case_collisions_keep_the_selected_account() {
+        let mut accounts: ProviderAccounts = serde_json::from_str(
+            r#"{
+            "profiles": [
+                {"id":"Work","name":"First","config_dir":"C:/first"},
+                {"id":"work","name":"Second","config_dir":"C:/second"},
+                {"id":"account_1","name":"Existing"}
+            ], "selected":"work"
+        }"#,
+        )
+        .unwrap();
+        accounts.normalize();
+        assert_eq!(accounts.profiles[0].id, "Work");
+        assert_eq!(accounts.profiles[2].id, "account_1");
+        assert_ne!(accounts.profiles[1].id.to_ascii_lowercase(), "work");
+        assert_eq!(accounts.selected().unwrap().name, "Second");
+        let normalized = accounts.clone();
+        accounts.normalize();
+        assert_eq!(accounts, normalized);
+        accounts.profiles.clear();
+        accounts.add();
+        assert!(!normalized
+            .profiles
+            .iter()
+            .any(|old| old.id.eq_ignore_ascii_case(&accounts.profiles[0].id)));
+    }
+
+    #[test]
+    fn environment_overrides_handle_empty_tilde_and_spaces_without_global_mutation() {
+        assert_eq!(environment_directory_value(None), None);
+        assert_eq!(environment_directory_value(Some("".into())), None);
         assert_eq!(
-            data.accounts["codex_local"]
-                .usage
-                .as_ref()
-                .unwrap()
-                .session
-                .percentage,
-            41.0
+            environment_directory_value(Some("C:\\Users\\Two Words\\.claude-work".into())),
+            Some(PathBuf::from("C:\\Users\\Two Words\\.claude-work"))
         );
-        assert!(data.accounts[&accounts[1].id].usage.is_none());
-        let encoded = serde_json::to_string(&data).unwrap();
-        let decoded: AppUsageData = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, data);
-        accounts.remove(0);
-        reconcile(&mut data, &accounts);
-        assert!(!data.accounts.contains_key("codex_local"));
-        assert!(data.get(ProviderId::Codex).is_none());
+        assert_eq!(
+            environment_directory_value(Some("~/.codex-work".into())),
+            crate::known_folders::home_dir().map(|home| home.join(".codex-work"))
+        );
     }
 
     #[test]
-    fn deduplication_uses_subject_and_workspace_not_name_or_email() {
-        let mut first = Account::new(0);
-        first.subject = "user1".into();
-        first.workspace = "team1".into();
-        let mut second = first.clone();
-        second.id = "codex_other".into();
-        second.name = "Personal".into();
-        assert_eq!(identity_match(&[first.clone()], &second), Some(0));
-        second.workspace = "team2".into();
-        assert_eq!(identity_match(&[first], &second), None);
+    fn explicit_file_overrides_directory_and_invalid_profiles_never_use_default() {
+        let profile = AccountProfile {
+            id: "work".into(),
+            config_dir: "C:\\work".into(),
+            credentials_path: "C:\\private\\work.json".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            profile.credential_path(ProviderId::Claude).unwrap(),
+            Some(PathBuf::from("C:\\private\\work.json"))
+        );
+        let empty = AccountProfile {
+            id: "work".into(),
+            ..Default::default()
+        };
+        assert!(empty.credential_path(ProviderId::Codex).is_err());
+        assert!(expand_path(Path::new("relative/path")).is_none());
+        assert_eq!(
+            AccountProfile::default()
+                .credential_path(ProviderId::Claude)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
-    fn alias_follows_first_visible_account_without_falling_through_to_another() {
-        let mut accounts = vec![Account::new(0), Account::new(1)];
-        let mut data = AppUsageData::default();
-        reconcile(&mut data, &accounts);
-        data.accounts.get_mut(&accounts[1].id).unwrap().usage = Some(UsageData::default());
-        data.refresh_codex_alias();
-        assert!(data.get(ProviderId::Codex).is_none());
-        accounts[0].visible = false;
-        reconcile(&mut data, &accounts);
-        assert!(data.get(ProviderId::Codex).is_some());
-        accounts[1].visible = false;
-        reconcile(&mut data, &accounts);
-        assert!(data.get(ProviderId::Codex).is_none());
-        assert_eq!(data.all_usage().count(), 0);
+    fn disabled_or_removed_selection_uses_first_enabled_account() {
+        let mut accounts = ProviderAccounts::default();
+        accounts.add();
+        accounts.profiles[1].enabled = true;
+        accounts.profiles[0].enabled = false;
+        accounts.normalize();
+        assert_eq!(accounts.selected, "account_1");
+        accounts.profiles.clear();
+        accounts.normalize();
+        assert!(accounts.selected().is_none());
     }
 }

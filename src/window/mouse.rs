@@ -1,4 +1,5 @@
 use super::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TME_NONCLIENT, TME_QUERY};
 
 pub(super) fn surface_index_for_window(state: &AppState, hwnd: HWND) -> Option<usize> {
     if state.hwnd.to_hwnd() == hwnd {
@@ -30,6 +31,7 @@ pub(super) fn mouse_target_at(hwnd: HWND, lparam: LPARAM) -> Option<(usize, Stri
     let surface_index = surface_index_for_window(state, hwnd)?;
     let theme = effective_theme_from_state(state)?;
     let scale = theme_surface_scale(&theme, surface_index).max(0.01);
+    let runtime = theme_runtime_for_surface(&theme, surface_index, theme_runtime_from_state(state));
     let (x, y) = mouse_client_point(lparam);
     let object_id = theme_engine::hit_test_mouse_event(
         &theme,
@@ -37,7 +39,7 @@ pub(super) fn mouse_target_at(hwnd: HWND, lparam: LPARAM) -> Option<(usize, Stri
         x / scale,
         y / scale,
         state.data.as_ref(),
-        theme_runtime_from_state(state),
+        runtime,
     )?;
     Some((surface_index, object_id))
 }
@@ -53,19 +55,6 @@ pub(super) fn mouse_handler_exists(
             theme_engine::mouse_event_script(theme, surface_index, object_id, event).is_some()
         })
     })
-}
-
-/// A point is drag-eligible when pressing the left button there would not
-/// trigger any action — right-click-only layers (e.g. the widget root's
-/// context menu) still allow dragging.
-pub(super) fn drag_point_eligible(hwnd: HWND, lparam: LPARAM) -> bool {
-    match mouse_target_at(hwnd, lparam) {
-        None => true,
-        Some((surface, object)) => {
-            !mouse_handler_exists(surface, &object, MouseEventKind::Click)
-                && !mouse_handler_exists(surface, &object, MouseEventKind::DoubleClick)
-        }
-    }
 }
 
 pub(super) fn dispatch_mouse_event(
@@ -105,7 +94,8 @@ pub(super) fn execute_mouse_action_source(
             return false;
         };
         let data = state.data.clone();
-        let runtime = theme_runtime_from_state(state);
+        let runtime =
+            theme_runtime_for_surface(&theme, surface_index, theme_runtime_from_state(state));
         theme_engine::execute_mouse_actions(
             &theme,
             surface_index,
@@ -126,8 +116,15 @@ pub(super) fn execute_mouse_action_source(
             sync_tray_icon(owner);
             for effect in effects {
                 match effect {
-                    MouseActionEffect::ShowDashboard => crate::dashboard::show(owner),
-                    MouseActionEffect::ToggleDashboard => crate::dashboard::toggle(owner),
+                    MouseActionEffect::ShowDashboard => {
+                        crate::dashboard::show(controller_for(owner))
+                    }
+                    MouseActionEffect::ToggleDashboard => {
+                        crate::dashboard::toggle(controller_for(owner))
+                    }
+                    MouseActionEffect::OpenUrl(url) => {
+                        open_web_url(owner, &url, "mouse action URL could not be opened")
+                    }
                     MouseActionEffect::ShowContextMenu(menu) => show_context_menu_document(
                         owner,
                         menu.as_deref(),
@@ -164,8 +161,13 @@ pub(super) fn schedule_or_dispatch_click(hwnd: HWND, surface_index: usize, objec
             state.hwnd.to_hwnd()
         };
         unsafe {
-            let _ = KillTimer(owner, TIMER_MOUSE_CLICK);
-            SetTimer(owner, TIMER_MOUSE_CLICK, GetDoubleClickTime().max(1), None);
+            let _ = kill_controller_timer(Some(owner), TIMER_MOUSE_CLICK);
+            set_controller_timer(
+                Some(owner),
+                TIMER_MOUSE_CLICK,
+                GetDoubleClickTime().max(1),
+                None,
+            );
         }
     } else {
         let _ = dispatch_mouse_event(surface_index, &object_id, MouseEventKind::Click);
@@ -187,22 +189,16 @@ pub(super) fn dispatch_double_click(hwnd: HWND, surface_index: usize, object_id:
         state.hwnd.to_hwnd()
     };
     unsafe {
-        let _ = KillTimer(owner, TIMER_MOUSE_CLICK);
+        let _ = kill_controller_timer(Some(owner), TIMER_MOUSE_CLICK);
     }
     let _ = dispatch_mouse_event(surface_index, &object_id, MouseEventKind::DoubleClick);
     let _ = hwnd;
 }
 
 pub(super) fn update_mouse_hover(hwnd: HWND, lparam: LPARAM) {
-    unsafe {
-        let mut tracking = TRACKMOUSEEVENT {
-            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-            dwFlags: TME_LEAVE,
-            hwndTrack: hwnd,
-            dwHoverTime: 0,
-        };
-        let _ = TrackMouseEvent(&mut tracking);
-    }
+    track_mouse_hover_with(hwnd, widget_tooltip::visible_for(hwnd), |tracking| unsafe {
+        TrackMouseEvent(tracking)
+    });
     for _ in 0..4 {
         let target = mouse_target_at(hwnd, lparam);
         let previous = {
@@ -228,7 +224,43 @@ pub(super) fn update_mouse_hover(hwnd: HWND, lparam: LPARAM) {
     }
 }
 
+fn track_mouse_hover_with(
+    hwnd: HWND,
+    tooltip_visible: bool,
+    mut track: impl FnMut(&mut TRACKMOUSEEVENT) -> windows::core::Result<()>,
+) {
+    let mut tracking = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_QUERY,
+        ..Default::default()
+    };
+    let active = if track(&mut tracking).is_ok()
+        && tracking.hwndTrack == hwnd
+        && !tracking.dwFlags.contains(TME_NONCLIENT)
+    {
+        tracking.dwFlags
+    } else {
+        Default::default()
+    };
+    let desired = if tooltip_visible {
+        TME_LEAVE
+    } else {
+        TME_LEAVE | TME_HOVER
+    };
+    let missing = desired & !active;
+    if missing.0 != 0 {
+        // Re-requesting TME_HOVER resets its timer, even for synthetic mouse
+        // moves caused by repainting/repositioning a stationary widget. Let
+        // Windows keep the hover rectangle and deadline until hover or leave.
+        tracking.dwFlags = missing;
+        tracking.hwndTrack = hwnd;
+        tracking.dwHoverTime = HOVER_DEFAULT;
+        let _ = track(&mut tracking);
+    }
+}
+
 pub(super) fn clear_mouse_hover(hwnd: HWND) {
+    widget_tooltip::hide_for(hwnd);
     let previous = {
         let mut state = lock_state();
         let Some(state) = state.as_mut() else {
@@ -258,7 +290,7 @@ pub(super) fn update_tray_mouse_hover(hwnd: HWND, surface_index: usize, object_i
         };
         if state.hovered_mouse_layer == target {
             unsafe {
-                SetTimer(hwnd, TIMER_TRAY_HOVER, 100, None);
+                set_controller_timer(Some(hwnd), TIMER_TRAY_HOVER, 100, None);
             }
             return;
         }
@@ -271,7 +303,7 @@ pub(super) fn update_tray_mouse_hover(hwnd: HWND, surface_index: usize, object_i
         let _ = dispatch_mouse_event(surface, &object, MouseEventKind::MouseEnter);
     }
     unsafe {
-        SetTimer(hwnd, TIMER_TRAY_HOVER, 100, None);
+        set_controller_timer(Some(hwnd), TIMER_TRAY_HOVER, 100, None);
     }
 }
 
@@ -296,11 +328,11 @@ pub(super) fn clear_tray_mouse_hover_if_left(hwnd: HWND) {
     };
     let Some((target, true)) = hovered else {
         unsafe {
-            let _ = KillTimer(hwnd, TIMER_TRAY_HOVER);
+            let _ = kill_controller_timer(Some(hwnd), TIMER_TRAY_HOVER);
         }
         return;
     };
-    if tray_icon::cursor_over_themed_icon(hwnd, target.0) {
+    if tray_icon::cursor_over_themed_icon(controller_for(hwnd), target.0) {
         return;
     }
     let previous = lock_state().as_mut().and_then(|state| {
@@ -309,47 +341,133 @@ pub(super) fn clear_tray_mouse_hover_if_left(hwnd: HWND) {
             .flatten()
     });
     unsafe {
-        let _ = KillTimer(hwnd, TIMER_TRAY_HOVER);
+        let _ = kill_controller_timer(Some(hwnd), TIMER_TRAY_HOVER);
     }
     if let Some((surface, object)) = previous {
         let _ = dispatch_mouse_event(surface, &object, MouseEventKind::MouseLeave);
     }
 }
 
-pub(super) unsafe fn set_surface_cursor(hwnd: HWND) -> bool {
+/// Answer WM_SETCURSOR without DefWindowProc. For a child surface it first
+/// sends WM_SETCURSOR to the parent, which for a taskbar-hosted surface is a
+/// synchronous call into Explorer on every mouse move.
+pub(super) unsafe fn set_surface_cursor(hwnd: HWND) {
+    let cursor = if surface_cursor_is_clickable(hwnd) {
+        IDC_HAND
+    } else {
+        IDC_ARROW
+    };
+    SetCursor(Some(LoadCursorW(None, cursor).unwrap_or_default()));
+}
+
+unsafe fn surface_cursor_is_clickable(hwnd: HWND) -> bool {
     let mut point = POINT::default();
     if GetCursorPos(&mut point).is_err() {
         return false;
     }
     let mut client = [point];
-    MapWindowPoints(HWND::default(), hwnd, &mut client);
+    MapWindowPoints(None, Some(hwnd), &mut client);
     let packed = ((client[0].y as u32 & 0xffff) << 16) | (client[0].x as u32 & 0xffff);
-    let lparam = LPARAM(packed as isize);
-    let is_main_window = {
-        let state = lock_state();
-        state.as_ref().is_some_and(|s| s.hwnd.to_hwnd() == hwnd)
+    let Some((surface, object)) = mouse_target_at(hwnd, LPARAM(packed as isize)) else {
+        return false;
     };
-    if let Some((surface, object)) = mouse_target_at(hwnd, lparam) {
-        let left_clickable = [MouseEventKind::Click, MouseEventKind::DoubleClick]
-            .into_iter()
-            .any(|event| mouse_handler_exists(surface, &object, event));
-        if left_clickable {
-            let cursor = LoadCursorW(HINSTANCE::default(), IDC_HAND).unwrap_or_default();
-            SetCursor(cursor);
-            return true;
+    [
+        MouseEventKind::Click,
+        MouseEventKind::DoubleClick,
+        MouseEventKind::RightClick,
+    ]
+    .into_iter()
+    .any(|event| mouse_handler_exists(surface, &object, event))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_mouse_moves_preserve_the_pending_hover_deadline() {
+        let hwnd = HWND(std::ptr::dangling_mut());
+        let mut active = TRACKMOUSEEVENT::default();
+        let mut deadline = None;
+        // Model Win32's documented timer reset on each TME_HOVER request.
+        // Repaints can generate mouse moves even with a stationary cursor.
+        for elapsed in (0..=500).step_by(50) {
+            track_mouse_hover_with(hwnd, false, |tracking| {
+                if tracking.dwFlags == TME_QUERY {
+                    tracking.hwndTrack = active.hwndTrack;
+                    tracking.dwFlags = active.dwFlags;
+                } else {
+                    assert_eq!(tracking.dwHoverTime, HOVER_DEFAULT);
+                    if tracking.dwFlags.contains(TME_HOVER) {
+                        deadline = Some(elapsed + 400);
+                    }
+                    active.hwndTrack = tracking.hwndTrack;
+                    active.dwFlags |= tracking.dwFlags;
+                }
+                Ok(())
+            });
         }
-        if !is_main_window && mouse_handler_exists(surface, &object, MouseEventKind::RightClick) {
-            let cursor = LoadCursorW(HINSTANCE::default(), IDC_HAND).unwrap_or_default();
-            SetCursor(cursor);
-            return true;
+        assert_eq!(deadline, Some(400), "mouse moves postponed the hover");
+        assert_eq!(active.dwFlags, TME_HOVER | TME_LEAVE);
+    }
+
+    #[test]
+    fn hover_tracking_rearms_after_hover_leave_and_window_changes() {
+        let hwnd = HWND(std::ptr::dangling_mut());
+        let mirror = HWND(2 as *mut _);
+        for (tracked, active, visible, expected) in [
+            // A visible tooltip needs leave notifications, without rearming hover.
+            (hwnd, TME_LEAVE, true, None),
+            (hwnd, TME_HOVER | TME_LEAVE, true, None),
+            // Windows cancels hover after delivering WM_MOUSEHOVER. A dismissed
+            // popup can be shown again on a later mouse move.
+            (hwnd, TME_LEAVE, false, Some(TME_HOVER)),
+            // Adding leave tracking must not reset an existing hover timer.
+            (hwnd, TME_HOVER, false, Some(TME_LEAVE)),
+            // WM_MOUSELEAVE cancels all tracking; re-entry needs both flags.
+            (hwnd, Default::default(), false, Some(TME_HOVER | TME_LEAVE)),
+            // Tracking another surface or its nonclient area is not reusable.
+            (
+                mirror,
+                TME_HOVER | TME_LEAVE,
+                false,
+                Some(TME_HOVER | TME_LEAVE),
+            ),
+            (
+                hwnd,
+                TME_NONCLIENT | TME_HOVER | TME_LEAVE,
+                false,
+                Some(TME_HOVER | TME_LEAVE),
+            ),
+        ] {
+            let mut requests = Vec::new();
+            track_mouse_hover_with(hwnd, visible, |tracking| {
+                if tracking.dwFlags == TME_QUERY {
+                    tracking.hwndTrack = tracked;
+                    tracking.dwFlags = active;
+                } else {
+                    assert_eq!(tracking.hwndTrack, hwnd);
+                    requests.push(tracking.dwFlags);
+                }
+                Ok(())
+            });
+            assert_eq!(requests, expected.into_iter().collect::<Vec<_>>());
         }
     }
-    if is_main_window {
-        // No left-click action here: the widget can be dragged from this
-        // point, so show the move cursor as the affordance.
-        let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEALL).unwrap_or_default();
-        SetCursor(cursor);
-        return true;
+
+    #[test]
+    fn failed_tracking_query_still_arms_hover() {
+        let hwnd = HWND(std::ptr::dangling_mut());
+        let mut requested = false;
+        track_mouse_hover_with(hwnd, false, |tracking| {
+            if tracking.dwFlags == TME_QUERY {
+                return Err(windows::core::Error::from_hresult(E_FAIL));
+            }
+            assert_eq!(tracking.hwndTrack, hwnd);
+            assert_eq!(tracking.dwFlags, TME_HOVER | TME_LEAVE);
+            requested = true;
+            Ok(())
+        });
+        assert!(requested);
     }
-    false
 }

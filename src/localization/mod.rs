@@ -2,20 +2,6 @@
 // adopts the legacy widget strings.
 #![allow(dead_code)]
 
-mod czech;
-mod dutch;
-mod english;
-mod french;
-mod german;
-mod helper_translations;
-mod japanese;
-mod korean;
-mod portuguese_brazil;
-mod russian;
-mod simplified_chinese;
-mod spanish;
-mod traditional_chinese;
-
 use windows::core::PWSTR;
 use windows::Win32::Globalization::{
     GetUserDefaultLocaleName, GetUserDefaultUILanguage, GetUserPreferredUILanguages,
@@ -25,86 +11,44 @@ use windows::Win32::Globalization::{
 use crate::providers::ProviderId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LanguageId {
-    English,
-    Czech,
-    Dutch,
-    Spanish,
-    French,
-    German,
-    Japanese,
-    Korean,
-    TraditionalChinese,
-    SimplifiedChinese,
-    Russian,
-    PortugueseBrazil,
+pub struct LanguageId(usize);
+
+struct Locale {
+    code: &'static str,
+    native_name: &'static str,
+    locale_patterns: &'static [&'static str],
+    windows_font: Option<(&'static str, &'static str)>,
+    update_via_winget_label: &'static str,
+    strings: Strings,
+    translations: &'static [(&'static str, &'static str)],
+}
+
+mod generated {
+    use super::{LanguageId, Locale, Strings};
+
+    include!(concat!(env!("OUT_DIR"), "/locales.rs"));
 }
 
 impl LanguageId {
-    pub const ALL: [LanguageId; 12] = [
-        LanguageId::English,
-        LanguageId::Czech,
-        LanguageId::Dutch,
-        LanguageId::Spanish,
-        LanguageId::French,
-        LanguageId::German,
-        LanguageId::Japanese,
-        LanguageId::Korean,
-        LanguageId::TraditionalChinese,
-        LanguageId::SimplifiedChinese,
-        LanguageId::Russian,
-        LanguageId::PortugueseBrazil,
-    ];
+    #[allow(non_upper_case_globals)]
+    pub const English: Self = Self(generated::ENGLISH_INDEX);
+
+    pub const ALL: [Self; generated::LANGUAGE_COUNT] = generated::LANGUAGE_IDS;
+
+    fn locale(self) -> &'static Locale {
+        &generated::LOCALES[self.0]
+    }
 
     pub fn code(self) -> &'static str {
-        match self {
-            Self::English => "en",
-            Self::Czech => "cs",
-            Self::Dutch => "nl",
-            Self::Spanish => "es",
-            Self::French => "fr",
-            Self::German => "de",
-            Self::Japanese => "ja",
-            Self::Korean => "ko",
-            Self::TraditionalChinese => "zh-TW",
-            Self::SimplifiedChinese => "zh-CN",
-            Self::Russian => "ru",
-            Self::PortugueseBrazil => "pt-BR",
-        }
+        self.locale().code
     }
 
     pub fn native_name(self) -> &'static str {
-        match self {
-            Self::English => "English",
-            Self::Czech => "Čeština",
-            Self::Dutch => "Nederlands",
-            Self::Spanish => "Español",
-            Self::French => "Français",
-            Self::German => "Deutsch",
-            Self::Japanese => "日本語",
-            Self::Korean => "한국어",
-            Self::TraditionalChinese => "繁體中文",
-            Self::SimplifiedChinese => "简体中文",
-            Self::Russian => "Русский",
-            Self::PortugueseBrazil => "Português (Brasil)",
-        }
+        self.locale().native_name
     }
 
     pub fn strings(self) -> Strings {
-        match self {
-            Self::English => english::STRINGS,
-            Self::Czech => czech::STRINGS,
-            Self::Dutch => dutch::STRINGS,
-            Self::Spanish => spanish::STRINGS,
-            Self::French => french::STRINGS,
-            Self::German => german::STRINGS,
-            Self::Japanese => japanese::STRINGS,
-            Self::Korean => korean::STRINGS,
-            Self::TraditionalChinese => traditional_chinese::STRINGS,
-            Self::SimplifiedChinese => simplified_chinese::STRINGS,
-            Self::Russian => russian::STRINGS,
-            Self::PortugueseBrazil => portuguese_brazil::STRINGS,
-        }
+        self.locale().strings
     }
 
     /// Translate user-interface text introduced by the dashboard and Theme Studio.
@@ -113,63 +57,25 @@ impl LanguageId {
     /// deliberately fall back to that key while a specialist term is awaiting
     /// a reviewed translation.
     pub fn text(self, english: &'static str) -> &'static str {
-        let strings = self.strings();
-        match english {
-            "Settings" => return strings.settings,
-            "Update frequency" => return strings.update_frequency,
-            "Start with Windows" => return strings.start_with_windows,
-            "Language" => return strings.language,
-            "System default" => return strings.system_default,
-            "Refresh" => return strings.refresh,
-            "Check for updates" => return strings.check_for_updates,
-            "Exit" => return strings.exit,
-            "Claude Code" => return strings.claude_code_model,
-            "Codex" => return strings.codex_model,
-            "Antigravity" => return strings.antigravity_model,
-            "OpenCode" => return strings.opencode_model,
-            "Cursor" => return strings.cursor_model,
-            _ => {}
-        }
-        if let Some(translation) = helper_translations::text(self, english) {
-            return translation;
-        }
-        match self {
-            Self::English => english::text(english),
-            Self::Czech => czech::text(english),
-            Self::Dutch => dutch::text(english),
-            Self::Spanish => spanish::text(english),
-            Self::French => french::text(english),
-            Self::German => german::text(english),
-            Self::Japanese => japanese::text(english),
-            Self::Korean => korean::text(english),
-            Self::TraditionalChinese => traditional_chinese::text(english),
-            Self::SimplifiedChinese => simplified_chinese::text(english),
-            Self::Russian => russian::text(english),
-            Self::PortugueseBrazil => portuguese_brazil::text(english),
-        }
+        let locale = self.locale();
+        locale
+            .translations
+            .binary_search_by(|(key, _)| (*key).cmp(english))
+            .map(|index| locale.translations[index].1)
+            .unwrap_or(english)
     }
 
     pub fn update_via_winget_label(self) -> &'static str {
-        match self {
-            Self::English => english::UPDATE_VIA_WINGET_LABEL,
-            Self::Czech => czech::UPDATE_VIA_WINGET_LABEL,
-            Self::Dutch => dutch::UPDATE_VIA_WINGET_LABEL,
-            Self::Spanish => spanish::UPDATE_VIA_WINGET_LABEL,
-            Self::French => french::UPDATE_VIA_WINGET_LABEL,
-            Self::German => german::UPDATE_VIA_WINGET_LABEL,
-            Self::Japanese => japanese::UPDATE_VIA_WINGET_LABEL,
-            Self::Korean => korean::UPDATE_VIA_WINGET_LABEL,
-            Self::TraditionalChinese => traditional_chinese::UPDATE_VIA_WINGET_LABEL,
-            Self::SimplifiedChinese => simplified_chinese::UPDATE_VIA_WINGET_LABEL,
-            Self::Russian => russian::UPDATE_VIA_WINGET_LABEL,
-            Self::PortugueseBrazil => portuguese_brazil::UPDATE_VIA_WINGET_LABEL,
-        }
+        self.locale().update_via_winget_label
     }
 
     pub fn provider_auth_error(self, provider: ProviderId) -> (&'static str, &'static str) {
         let strings = self.strings();
         match provider {
-            ProviderId::Claude => (strings.token_expired_title, strings.token_expired_body),
+            ProviderId::Claude => (
+                strings.token_expired_title,
+                self.text("Sign in again with the Claude desktop app or run 'claude' and use '/login' for your CLI account. Then refresh this monitor."),
+            ),
             ProviderId::Codex => (
                 strings.codex_token_expired_title,
                 strings.codex_token_expired_body,
@@ -186,6 +92,14 @@ impl LanguageId {
                 strings.cursor_token_expired_title,
                 strings.cursor_token_expired_body,
             ),
+            ProviderId::Grok => (
+                strings.grok_token_expired_title,
+                strings.grok_token_expired_body,
+            ),
+            ProviderId::Copilot => (
+                strings.copilot_token_expired_title,
+                strings.copilot_token_expired_body,
+            ),
         }
     }
 
@@ -195,31 +109,26 @@ impl LanguageId {
             return None;
         }
 
-        let prefix = normalized.split('-').next().unwrap_or_default();
-        match prefix {
-            "en" => Some(Self::English),
-            "cs" => Some(Self::Czech),
-            "nl" => Some(Self::Dutch),
-            "es" => Some(Self::Spanish),
-            "fr" => Some(Self::French),
-            "de" => Some(Self::German),
-            "ja" => Some(Self::Japanese),
-            "ko" => Some(Self::Korean),
-            "zh" => {
-                if normalized.contains("tw")
-                    || normalized.contains("hk")
-                    || normalized.contains("mo")
-                    || normalized.contains("hant")
-                {
-                    Some(Self::TraditionalChinese)
-                } else {
-                    Some(Self::SimplifiedChinese)
-                }
-            }
-            "ru" => Some(Self::Russian),
-            "pt" => Some(Self::PortugueseBrazil),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|language| {
+            language.locale().locale_patterns.iter().any(|pattern| {
+                normalized == *pattern
+                    || normalized
+                        .strip_prefix(pattern)
+                        .is_some_and(|suffix| suffix.starts_with('-'))
+            })
+        })
+    }
+
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+
+    pub(crate) fn from_index(index: usize) -> Option<Self> {
+        (index < generated::LANGUAGE_COUNT).then_some(Self(index))
+    }
+
+    pub(crate) fn windows_font(self) -> Option<(&'static str, &'static str)> {
+        self.locale().windows_font
     }
 }
 
@@ -238,6 +147,8 @@ pub struct Strings {
     pub antigravity_model: &'static str,
     pub opencode_model: &'static str,
     pub cursor_model: &'static str,
+    pub grok_model: &'static str,
+    pub copilot_model: &'static str,
     pub settings: &'static str,
     pub start_with_windows: &'static str,
     pub language: &'static str,
@@ -273,10 +184,16 @@ pub struct Strings {
     pub opencode_token_expired_body: &'static str,
     pub cursor_token_expired_title: &'static str,
     pub cursor_token_expired_body: &'static str,
+    pub grok_token_expired_title: &'static str,
+    pub grok_token_expired_body: &'static str,
+    pub copilot_token_expired_title: &'static str,
+    pub copilot_token_expired_body: &'static str,
     pub codex_window_title: &'static str,
     pub antigravity_window_title: &'static str,
     pub opencode_window_title: &'static str,
     pub cursor_window_title: &'static str,
+    pub grok_window_title: &'static str,
+    pub copilot_window_title: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {
@@ -300,13 +217,8 @@ fn preferred_ui_languages() -> Vec<String> {
     unsafe {
         let mut num_languages = 0u32;
         let mut buffer_len = 0u32;
-        if GetUserPreferredUILanguages(
-            MUI_LANGUAGE_NAME,
-            &mut num_languages,
-            PWSTR::null(),
-            &mut buffer_len,
-        )
-        .is_err()
+        if GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &mut num_languages, None, &mut buffer_len)
+            .is_err()
             || buffer_len == 0
         {
             return Vec::new();
@@ -316,7 +228,7 @@ fn preferred_ui_languages() -> Vec<String> {
         if GetUserPreferredUILanguages(
             MUI_LANGUAGE_NAME,
             &mut num_languages,
-            PWSTR(buffer.as_mut_ptr()),
+            Some(PWSTR(buffer.as_mut_ptr())),
             &mut buffer_len,
         )
         .is_err()
@@ -405,12 +317,13 @@ mod tests {
             "All files",
             "Theme Studio packages",
             "Images",
-            "Action helper",
+            "Builder",
             "Build safe mouse actions that affect layers at runtime.",
             "Choose one action for this context menu item.",
             "Enter actions...",
             "Show dashboard",
             "Toggle dashboard",
+            "Context Menus",
             "Show context menu",
             "Set property",
             "Reset property",
@@ -445,9 +358,46 @@ mod tests {
 
     #[test]
     fn untranslated_specialist_text_falls_back_to_english() {
+        let japanese = LanguageId::from_code("ja").unwrap();
         assert_eq!(
-            LanguageId::Japanese.text("A future specialist label"),
+            japanese.text("A future specialist label"),
             "A future specialist label"
         );
+    }
+
+    #[test]
+    fn supported_locale_codes_are_recognized() {
+        for (index, language) in LanguageId::ALL.into_iter().enumerate() {
+            assert_eq!(LanguageId::from_index(index), Some(language));
+            assert_eq!(
+                LanguageId::from_code(language.code()),
+                Some(language),
+                "{}",
+                language.code()
+            );
+        }
+
+        assert_eq!(LanguageId::from_code("tr_TR").unwrap().code(), "tr");
+        assert_eq!(LanguageId::from_code("zh-HK").unwrap().code(), "zh-TW");
+        assert_eq!(LanguageId::from_code("zh-SG").unwrap().code(), "zh-CN");
+    }
+
+    #[test]
+    fn generated_translation_catalogues_are_sorted_and_complete() {
+        let expected_keys = LanguageId::English.locale().translations.len();
+        assert!(expected_keys > 0);
+
+        for language in LanguageId::ALL {
+            let translations = language.locale().translations;
+            assert_eq!(translations.len(), expected_keys, "{}", language.code());
+            assert!(
+                translations.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "{} translations are not sorted",
+                language.code()
+            );
+            assert!(translations
+                .iter()
+                .all(|(_, value)| !value.trim().is_empty()));
+        }
     }
 }

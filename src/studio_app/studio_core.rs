@@ -1,5 +1,14 @@
 use super::*;
 
+fn clock_refresh_delay(interval: Duration) -> Duration {
+    let interval_ms = interval.as_millis().max(1);
+    let elapsed_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    Duration::from_millis((interval_ms - elapsed_ms % interval_ms) as u64)
+}
+
 impl StudioApp {
     pub(super) fn language(&self) -> LanguageId {
         localization::resolve_language(
@@ -19,6 +28,28 @@ impl StudioApp {
         ThemeRuntime::from_providers(self.settings.enabled_providers())
             .with_poll_state(self.usage_poll_ok, self.usage_has_error)
             .with_language(language)
+            .with_countdown(self.settings.usage_countdown)
+            .with_windows_default_font(self.settings.use_windows_default_font)
+            .with_antigravity_pools(
+                self.settings.antigravity_gemini_enabled(),
+                self.settings.antigravity_external_enabled(),
+                1.0,
+            )
+    }
+
+    pub(super) fn theme_runtime_for_surface(&self, surface_index: usize) -> ThemeRuntime {
+        crate::window::query_theme_runtime_for_surface(
+            &self.theme,
+            surface_index,
+            self.theme_runtime(),
+        )
+    }
+
+    pub(super) fn selected_theme_runtime(&self) -> ThemeRuntime {
+        let surface_index = match self.selection {
+            Selection::Surface(index) | Selection::Object(index, _) => index,
+        };
+        self.theme_runtime_for_surface(surface_index)
     }
 
     pub(super) fn new(
@@ -26,12 +57,21 @@ impl StudioApp {
         owner: isize,
         initial_page: Page,
     ) -> Self {
+        style_native_titlebar(context);
+        Self::new_with_context(&context.egui_ctx, owner, initial_page)
+    }
+
+    pub(super) fn new_with_context(
+        context: &egui::Context,
+        owner: isize,
+        initial_page: Page,
+    ) -> Self {
+        crate::diagnose::log_lazy(|| format!("dashboard started owner={owner}"));
         let settings = app_settings::load_settings();
         let language = localization::resolve_language(
             settings.language.as_deref().and_then(LanguageId::from_code),
         );
-        configure_style(&context.egui_ctx, language);
-        style_native_titlebar(context);
+        configure_style(context, language);
         let classic_theme_path = theme_engine::ensure_starter_theme().ok();
         let configured_path = settings.active_theme_path.as_ref().map(PathBuf::from);
         let configured_theme = configured_path
@@ -55,47 +95,64 @@ impl StudioApp {
             .as_deref()
             .and_then(|path| context_menu::load_context_menu(path).ok())
             .unwrap_or_else(context_menu::classic_context_menu);
-        let mut usage_cache = app_settings::load_usage_cache();
-        if let Some(cache) = &mut usage_cache {
-            crate::accounts::reconcile(&mut cache.data, &settings.codex_accounts);
-            theme = theme_engine::account_classic(
-                &theme,
-                Some(&cache.data),
-                settings.enabled_providers(),
-            );
-        }
-        let usage_poll_ok = usage_cache.as_ref().is_some_and(|cache| cache.poll_ok);
-        let usage_has_error = usage_cache.as_ref().is_some_and(|cache| !cache.poll_ok);
+        let usage_cache = app_settings::load_usage_cache().map(|mut cache| {
+            cache.data.select_accounts(&settings.accounts);
+            cache
+        });
+        let usage_poll_ok = usage_cache
+            .as_ref()
+            .is_some_and(|cache| cache.poll_ok && !cache.data.is_empty());
+        let usage_has_error = usage_cache.as_ref().is_some_and(|cache| {
+            !cache.poll_ok
+                || (cache.data.is_empty()
+                    && cache
+                        .data
+                        .accounts
+                        .iter()
+                        .any(|account| account.error.is_some()))
+        });
+        let usage = usage_cache.map(|cache| cache.data);
+        let next_preview_countdown_refresh = preview_countdown_refresh_delay(usage.as_ref())
+            .and_then(|delay| Instant::now().checked_add(delay));
+        let next_preview_clock_refresh = theme
+            .current_time_refresh_interval()
+            .and_then(|interval| Instant::now().checked_add(clock_refresh_delay(interval)));
         Self {
             owner,
+            update_status: crate::dashboard::read_update_status(owner),
+            diagnostics: studio_diagnostics::DiagnosticsView::new(),
             page: initial_page,
+            synced_poll_interval_ms: settings.poll_interval_ms,
+            synced_taskbar_lock: settings.lock_taskbar,
+            poll_interval_editor_generation: 0,
             settings,
-            account_login: None,
-            account_job: None,
-            account_error: None,
-            account_delete: None,
             startup_enabled: crate::window::is_startup_enabled(),
             theme,
             theme_path,
+            available_themes: AvailableThemesCache::new(theme_engine::themes_directory()),
             selection: Selection::Surface(0),
             preview: None,
             preview_dirty: true,
-            usage: usage_cache.map(|cache| cache.data),
+            preview_renderer: PreviewRenderer::new(context.clone()),
+            preview_generation: 0,
+            preview_render_key: None,
+            usage,
             usage_poll_ok,
             usage_has_error,
             last_cache_read: Instant::now(),
+            next_preview_countdown_refresh,
+            next_preview_clock_refresh,
             dirty: false,
             live_apply: DEFAULT_LIVE_APPLY,
             zoom: 1.0,
+            preview_pan: egui::Vec2::ZERO,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             history_snapshot,
             scene_width: DEFAULT_SCENE_WIDTH,
             inspector_width: DEFAULT_INSPECTOR_WIDTH,
             hovered_scene_item: None,
-            expression_helper: None,
-            action_helper: None,
-            text_template_helper: None,
+            helper: None,
             preview_mouse_overrides: HashMap::new(),
             preview_hover_target: None,
             preview_pending_click: None,
@@ -115,45 +172,59 @@ impl StudioApp {
             context_menu_path,
             context_menu_dirty: false,
             context_menu_selection: None,
-            context_menu_action_helper: None,
             delete_context_menu_confirmation: None,
         }
     }
 
     pub(super) fn notify_owner(&self) {
-        if self.owner != 0 {
-            unsafe {
-                let _ = PostMessageW(
-                    HWND(self.owner as *mut _),
-                    WM_APP_SETTINGS_UPDATED,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
+        let _ = studio_diagnostics::send_owner_message(self.owner, WM_APP_SETTINGS_UPDATED);
+    }
+
+    pub(super) fn request_refresh(&mut self) {
+        crate::diagnose::log("Refresh now clicked in dashboard");
+        match studio_diagnostics::send_owner_message(self.owner, WM_APP_REFRESH_NOW) {
+            Ok(()) => {
+                crate::diagnose::log("refresh request delivered to monitor message queue");
+                self.settings_error = None;
+            }
+            Err(error) => {
+                crate::diagnose::log(&error);
+                self.settings_error = Some(error);
             }
         }
     }
 
-    pub(super) fn post_owner(&self, message: u32) {
-        if self.owner != 0 {
-            unsafe {
-                let _ = PostMessageW(HWND(self.owner as *mut _), message, WPARAM(0), LPARAM(0));
-            }
+    pub(super) fn sync_poll_interval(&mut self, persisted_interval: u32) {
+        // A local frequency edit wins; other dashboard edits must preserve a
+        // newer interval selected from the widget's context menu.
+        if self.settings.poll_interval_ms == self.synced_poll_interval_ms
+            && self.settings.poll_interval_ms != persisted_interval
+        {
+            self.settings.poll_interval_ms = persisted_interval;
+            // Drop the numeric control's old text buffer so losing focus cannot
+            // commit the previous custom value over the menu selection.
+            self.poll_interval_editor_generation =
+                self.poll_interval_editor_generation.wrapping_add(1);
         }
+        self.synced_poll_interval_ms = persisted_interval;
+    }
+
+    pub(super) fn sync_taskbar_lock(&mut self, persisted_lock: bool) {
+        // Preserve a local toggle; unrelated edits adopt the latest menu value.
+        if self.settings.lock_taskbar == self.synced_taskbar_lock {
+            self.settings.lock_taskbar = persisted_lock;
+        }
+        self.synced_taskbar_lock = persisted_lock;
     }
 
     pub(super) fn save_settings(&mut self) {
-        crate::accounts::reconcile(
-            self.usage.get_or_insert_with(Default::default),
-            &self.settings.codex_accounts,
-        );
-        self.theme = theme_engine::account_classic(
-            &self.theme,
-            self.usage.as_ref(),
-            self.settings.enabled_providers(),
-        );
-        self.preview_dirty = true;
+        let persisted = app_settings::load_settings();
+        self.sync_poll_interval(persisted.poll_interval_ms);
+        self.sync_taskbar_lock(persisted.lock_taskbar);
         match app_settings::save_settings(&self.settings) {
             Ok(()) => {
+                self.synced_poll_interval_ms = self.settings.poll_interval_ms;
+                self.synced_taskbar_lock = self.settings.lock_taskbar;
                 self.settings_error = None;
                 self.notify_owner();
             }
@@ -188,6 +259,7 @@ impl StudioApp {
             }
         };
         self.theme_path = Some(path.clone());
+        self.available_themes.invalidate();
         self.settings.active_theme_path = Some(path.to_string_lossy().into_owned());
         self.settings.custom_theme_enabled = true;
         self.dirty = false;
@@ -229,9 +301,7 @@ impl StudioApp {
         self.dirty = false;
         self.theme_error = None;
         self.reset_history();
-        self.expression_helper = None;
-        self.action_helper = None;
-        self.text_template_helper = None;
+        self.close_helper(false);
         self.asset_picker = None;
         self.preview_mouse_overrides.clear();
         self.preview_hover_target = None;
@@ -258,12 +328,13 @@ impl StudioApp {
         }
         match theme_package::import_path(source) {
             Ok(imported) => {
+                self.available_themes.invalidate();
                 if let Some((menu, path)) = imported.context_menu {
                     self.context_menu = menu;
                     self.context_menu_path = Some(path);
                     self.context_menu_dirty = false;
                     self.context_menu_selection = None;
-                    self.context_menu_action_helper = None;
+                    self.close_helper(true);
                 }
                 if imported.imported_assets > 0 {
                     self.asset_thumbnails.clear();
@@ -447,9 +518,7 @@ impl StudioApp {
         self.selection = Selection::Surface(0);
         self.preview_dirty = true;
         self.dirty = true;
-        self.expression_helper = None;
-        self.action_helper = None;
-        self.text_template_helper = None;
+        self.close_helper(false);
         self.asset_picker = None;
         self.preview_mouse_overrides.clear();
         self.preview_hover_target = None;
@@ -468,9 +537,7 @@ impl StudioApp {
         self.selection = Selection::Surface(0);
         self.preview_dirty = true;
         self.dirty = true;
-        self.expression_helper = None;
-        self.action_helper = None;
-        self.text_template_helper = None;
+        self.close_helper(false);
         self.asset_picker = None;
         self.preview_mouse_overrides.clear();
         self.preview_hover_target = None;
@@ -485,6 +552,7 @@ impl StudioApp {
         context: &egui::Context,
     ) {
         match action {
+            PendingUnsavedAction::Update { install } => self.send_update_action(install),
             PendingUnsavedAction::Close => {
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -656,6 +724,7 @@ impl StudioApp {
         if theme_engine::delete_theme(&deletion.path).is_err() {
             return;
         }
+        self.available_themes.invalidate();
 
         self.theme = fallback_theme;
         self.theme_path = Some(fallback_path.clone());
@@ -664,9 +733,7 @@ impl StudioApp {
         self.selection = Selection::Surface(0);
         self.preview_dirty = true;
         self.dirty = false;
-        self.expression_helper = None;
-        self.action_helper = None;
-        self.text_template_helper = None;
+        self.close_helper(false);
         self.asset_picker = None;
         self.preview_mouse_overrides.clear();
         self.preview_hover_target = None;
@@ -725,29 +792,196 @@ impl StudioApp {
         }
     }
 
+    pub(super) fn update_usage_cache(&mut self, mut cache: UsageCache) -> bool {
+        cache.data.select_accounts(&self.settings.accounts);
+        let poll_ok = cache.poll_ok && !cache.data.is_empty();
+        let has_error = !cache.poll_ok
+            || (cache.data.is_empty()
+                && cache
+                    .data
+                    .accounts
+                    .iter()
+                    .any(|account| account.error.is_some()));
+        let changed = self.usage.as_ref() != Some(&cache.data)
+            || self.usage_poll_ok != poll_ok
+            || self.usage_has_error != has_error;
+        if changed {
+            crate::diagnose::log_lazy(|| {
+                format!(
+                    "dashboard loaded usage cache: updated={} accounts={} poll_ok={poll_ok}",
+                    cache.updated_unix,
+                    cache.data.accounts.len()
+                )
+            });
+            self.usage = Some(cache.data);
+            self.usage_poll_ok = poll_ok;
+            self.usage_has_error = has_error;
+        }
+        changed
+    }
+
     pub(super) fn refresh_usage_cache(&mut self) {
-        self.update_accounts();
-        if self.last_cache_read.elapsed() >= Duration::from_secs(1) {
-            self.last_cache_read = Instant::now();
-            if let Some(cache) = app_settings::load_usage_cache() {
-                self.usage = Some(cache.data);
-                crate::accounts::reconcile(
-                    self.usage.as_mut().unwrap(),
-                    &self.settings.codex_accounts,
-                );
-                self.theme = theme_engine::account_classic(
-                    &self.theme,
-                    self.usage.as_ref(),
-                    self.settings.enabled_providers(),
-                );
-                self.usage_poll_ok = cache.poll_ok;
-                self.usage_has_error = !cache.poll_ok;
-                self.preview_dirty = true;
-            }
+        if self.last_cache_read.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        let now = Instant::now();
+        self.last_cache_read = now;
+        if let Some(owner) = crate::dashboard::resolve_monitor_owner(self.owner) {
+            self.owner = owner;
+        }
+        self.update_status = crate::dashboard::read_update_status(self.owner);
+        let persisted = app_settings::load_settings();
+        self.sync_poll_interval(persisted.poll_interval_ms);
+        self.sync_taskbar_lock(persisted.lock_taskbar);
+        let usage_changed =
+            app_settings::load_usage_cache().is_some_and(|cache| self.update_usage_cache(cache));
+        let countdown_due = self
+            .next_preview_countdown_refresh
+            .is_some_and(|deadline| now >= deadline);
+        let clock_interval = self.theme.current_time_refresh_interval();
+        let clock_due = clock_interval.is_some()
+            && self
+                .next_preview_clock_refresh
+                .is_none_or(|deadline| now >= deadline);
+        if usage_changed || countdown_due || clock_due {
+            self.preview_dirty = true;
+            self.next_preview_countdown_refresh =
+                preview_countdown_refresh_delay(self.usage.as_ref())
+                    .and_then(|delay| now.checked_add(delay));
+        }
+        if clock_interval.is_none() {
+            self.next_preview_clock_refresh = None;
+        } else if clock_due {
+            self.next_preview_clock_refresh = clock_interval
+                .map(clock_refresh_delay)
+                .and_then(|delay| now.checked_add(delay));
         }
     }
 
+    pub(super) fn request_update_action(&mut self) {
+        if self.update_status.is_busy() || self.pending_unsaved_action.is_some() {
+            return;
+        }
+        let install = matches!(
+            self.update_status,
+            crate::dashboard::UpdateStatus::Available(_)
+        );
+        // The usual check can offer to install immediately. Resolve unsaved
+        // edits first so they cannot keep the dashboard executable locked.
+        if self.dirty {
+            self.pending_unsaved_action = Some(PendingUnsavedAction::Update { install });
+        } else {
+            self.send_update_action(install);
+        }
+    }
+
+    fn send_update_action(&mut self, install: bool) {
+        // A refresh click must still check and prompt even if an automatic
+        // check has found a release since the dashboard last read the status.
+        let message = if install {
+            native_interop::WM_APP_UPDATE_ACTION
+        } else {
+            native_interop::WM_APP_CHECK_FOR_UPDATES
+        };
+        match studio_diagnostics::send_owner_message(self.owner, message) {
+            Ok(()) => {
+                self.update_status = if install {
+                    crate::dashboard::UpdateStatus::Applying
+                } else {
+                    crate::dashboard::UpdateStatus::Checking
+                };
+                self.last_cache_read = Instant::now();
+            }
+            Err(error) => self.theme_error = Some(error),
+        }
+    }
+
+    pub(super) fn version_button(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        use crate::dashboard::UpdateStatus;
+        let language = self.language();
+        let (icon, tooltip) = match &self.update_status {
+            UpdateStatus::Available(version) => (
+                LucideIcon::Download,
+                language
+                    .text("Click to update to v{version}")
+                    .replace("{version}", version),
+            ),
+            UpdateStatus::Checking => (
+                LucideIcon::RefreshCw,
+                language.strings().checking_for_updates.to_string(),
+            ),
+            UpdateStatus::Applying => (
+                LucideIcon::Download,
+                language.strings().applying_update.to_string(),
+            ),
+            UpdateStatus::Idle => (
+                LucideIcon::RefreshCw,
+                language.text("Check for updates").to_string(),
+            ),
+        };
+        let response = ui
+            .scope(|ui| {
+                ui.add_enabled_ui(!self.update_status.is_busy(), |ui| {
+                    let icon_id = egui::IdSalt::new("version-update-icon");
+                    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+                    let background = ui.painter().add(egui::Shape::Noop);
+                    let button = egui::WidgetAtom::new((
+                        egui::RichText::new(&version).size(16.0).color(muted()),
+                        egui::Atom::custom(icon_id, egui::vec2(12.0, 12.0)),
+                    ))
+                    .gap(4.0)
+                    // The footer row is bottom-aligned; centre the contents
+                    // independently so its extra height is not all above them.
+                    .align2(egui::Align2::LEFT_CENTER)
+                    .sense(egui::Sense::click())
+                    .min_size(egui::vec2(0.0, CONTROL_HEIGHT))
+                    .frame(egui::Frame::new().inner_margin(egui::Margin {
+                        left: 5,
+                        right: 5,
+                        top: 2,
+                        bottom: 4,
+                    }))
+                    .show(ui);
+                    if button.response.hovered() || button.response.has_focus() {
+                        ui.painter().set(
+                            background,
+                            egui::Shape::rect_filled(
+                                button.response.rect,
+                                4.0,
+                                crate::ui::theme::menu_hover(),
+                            ),
+                        );
+                    }
+                    button.response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), &version)
+                    });
+                    if let Some(rect) = button.rect(icon_id) {
+                        crate::ui::components::icon::paint_centered_icon(
+                            ui,
+                            rect.translate(egui::vec2(0.0, 1.0)),
+                            icon,
+                            12.0,
+                            muted(),
+                        );
+                    }
+                    button.response
+                })
+                .inner
+            })
+            .inner;
+        let response = response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(&tooltip)
+            .on_disabled_hover_text(&tooltip);
+        if response.clicked() {
+            self.request_update_action();
+        }
+        response
+    }
+
     pub(super) fn shell(&mut self, ui: &mut egui::Ui) {
+        const GITHUB_URL: &str = "https://github.com/CodeZeno/Claude-Code-Usage-Monitor";
+
         let language = self.language();
         let full_height = ui.available_height();
         ui.horizontal(|ui| {
@@ -763,7 +997,7 @@ impl StudioApp {
                             left: 8,
                             right: 8,
                             top: 20,
-                            bottom: 0,
+                            bottom: 4,
                         })
                         .show(ui, |ui| {
                             ui.set_width(DEFAULT_MENU_WIDTH - 16.0);
@@ -786,6 +1020,38 @@ impl StudioApp {
                                 language.text("Context Menus"),
                             );
                             nav(ui, &mut self.page, Page::Assets, language.text("Assets"));
+                            ui.separator();
+                            nav(
+                                ui,
+                                &mut self.page,
+                                Page::Diagnostics,
+                                language.text("Diagnostics"),
+                            );
+                            ui.allocate_ui_with_layout(
+                                ui.available_size(),
+                                egui::Layout::bottom_up(egui::Align::Min),
+                                |ui| {
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(
+                                            ui.available_width(),
+                                            crate::ui::components::navigation::ITEM_HEIGHT,
+                                        ),
+                                        egui::Layout::left_to_right(egui::Align::Max),
+                                        |ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            crate::ui::components::navigation::github_link(
+                                                ui, GITHUB_URL,
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Max),
+                                                |ui| {
+                                                    self.version_button(ui);
+                                                },
+                                            );
+                                        },
+                                    );
+                                },
+                            );
                         });
                 },
             );
@@ -824,6 +1090,7 @@ impl StudioApp {
                         Page::Studio => self.studio_page(ui),
                         Page::ContextMenus => self.context_menus_page(ui),
                         Page::Assets => self.assets_page(ui),
+                        Page::Diagnostics => self.diagnostics_page(ui),
                     }
                 },
             );

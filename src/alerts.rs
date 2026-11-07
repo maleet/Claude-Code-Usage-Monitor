@@ -46,7 +46,7 @@ struct WindowState {
 
 impl WindowState {
     fn evaluate(&mut self, usage: &UsageSection, thresholds: &[u8], now: u64) -> Option<u8> {
-        if !usage.percentage.is_finite() || usage.percentage < 0.0 {
+        if !usage.available || !usage.percentage.is_finite() || usage.percentage < 0.0 {
             return None;
         }
         let reset = usage
@@ -101,23 +101,38 @@ impl AlertState {
             return messages;
         }
         for provider in settings.enabled_providers().iter() {
-            if provider == ProviderId::Codex && !data.account_order.is_empty() {
-                for account in data.account_order.iter().filter(|account| account.visible) {
-                    if let Some(entry) = data
-                        .accounts
-                        .get(&account.id)
-                        .filter(|entry| entry.error.is_none())
-                    {
-                        if let Some(usage) = &entry.usage {
-                            self.check_usage(
-                                &format!("codex:{}", account.id),
-                                &account.name,
-                                usage,
-                                &settings.usage_alerts,
-                                now,
-                                &mut messages,
-                            );
-                        }
+            if data
+                .accounts
+                .iter()
+                .any(|account| account.provider == provider)
+            {
+                for account in data.accounts.iter().filter(|account| {
+                    account.provider == provider
+                        && account.profile.enabled
+                        && account.error.is_none()
+                        && settings.accounts.get(provider).is_some_and(|configured| {
+                            configured.profiles.iter().any(|profile| {
+                                profile.enabled
+                                    && profile.id == account.profile.id
+                                    && profile.same_source(&account.profile)
+                            })
+                        })
+                }) {
+                    if let Some(usage) = &account.usage {
+                        let key = format!("{}:{}", provider.descriptor().key, account.profile.id);
+                        self.migrate_default_windows(provider, &account.profile, &key);
+                        self.check_usage(
+                            &key,
+                            &format!(
+                                "{} ({})",
+                                provider.descriptor().display_name,
+                                account.profile.name
+                            ),
+                            usage,
+                            &settings.usage_alerts,
+                            now,
+                            &mut messages,
+                        );
                     }
                 }
             } else if let Some(usage) = data.get(provider) {
@@ -134,6 +149,33 @@ impl AlertState {
         messages
     }
 
+    fn migrate_default_windows(
+        &mut self,
+        provider: ProviderId,
+        profile: &crate::accounts::AccountProfile,
+        key: &str,
+    ) {
+        if profile.id != "default"
+            || !profile.config_dir.is_empty()
+            || !profile.credentials_path.is_empty()
+        {
+            return;
+        }
+        let legacy = if provider == ProviderId::Codex {
+            "codex:codex_local"
+        } else {
+            provider.descriptor().key
+        };
+        for window in ["session", "weekly"] {
+            let target = format!("{key}/{window}");
+            if !self.windows.contains_key(&target) {
+                if let Some(previous) = self.windows.remove(&format!("{legacy}/{window}")) {
+                    self.windows.insert(target, previous);
+                }
+            }
+        }
+    }
+
     fn check_usage(
         &mut self,
         key: &str,
@@ -143,8 +185,16 @@ impl AlertState {
         now: u64,
         messages: &mut Vec<String>,
     ) {
+        if usage.stale {
+            return;
+        }
         for (window, label, enabled, section) in [
-            ("session", "5h", settings.session, &usage.session),
+            (
+                "session",
+                usage.session_label.as_deref().unwrap_or("5h"),
+                settings.session,
+                &usage.session,
+            ),
             (
                 "weekly",
                 usage.weekly_label.as_deref().unwrap_or("7d"),
@@ -249,6 +299,7 @@ mod tests {
 
     fn usage(percentage: f64, reset: Option<u64>) -> UsageSection {
         UsageSection {
+            available: true,
             percentage,
             resets_at: reset.map(|seconds| UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
         }
@@ -354,6 +405,7 @@ mod tests {
                 session: usage(95.0, Some(1000)),
                 weekly: usage(90.0, Some(2000)),
                 weekly_label: None,
+                ..Default::default()
             },
         )]
         .into_iter()
@@ -379,36 +431,39 @@ mod tests {
         settings.set_enabled_providers(crate::providers::ProviderSet::from_enabled([
             ProviderId::Codex,
         ]));
-        let mut first = crate::accounts::legacy_accounts().remove(0);
+        let mut first = crate::accounts::AccountProfile::default();
         first.id = "first".into();
         let mut second = first.clone();
         second.id = "second".into();
         second.name = "Second account".into();
+        settings.accounts.codex.profiles = vec![first.clone(), second.clone()];
         let mut data = AppUsageData::default();
-        data.account_order = vec![first, second];
-        let entry = crate::accounts::AccountUsage {
+        let entry = crate::models::AccountUsage {
+            provider: ProviderId::Codex,
+            profile: first,
+            source_signature: "test".into(),
+            source_path: None,
+            error: None,
+            selected: true,
             usage: Some(UsageData {
                 session: usage(95.0, Some(1000)),
                 ..Default::default()
             }),
-            ..Default::default()
         };
-        data.accounts.insert("first".into(), entry.clone());
-        data.accounts.insert(
-            "second".into(),
-            crate::accounts::AccountUsage {
-                error: Some("Unable to refresh usage".into()),
-                ..entry
-            },
-        );
+        data.accounts.push(entry.clone());
+        data.accounts.push(crate::models::AccountUsage {
+            profile: second,
+            error: Some(crate::poller::PollError::NetworkError),
+            ..entry
+        });
         let mut state = AlertState::default();
         assert_eq!(state.evaluate(&settings, &data, 100).len(), 1);
-        data.accounts.get_mut("second").unwrap().error = None;
+        data.accounts[1].error = None;
         let messages = state.evaluate(&settings, &data, 100);
         assert_eq!(messages.len(), 1);
-        assert!(messages[0].starts_with("Second account"));
+        assert!(messages[0].contains("Second account"));
         assert!(state.evaluate(&settings, &data, 100).is_empty());
-        data.account_order[1].visible = false;
+        settings.accounts.codex.profiles[1].enabled = false;
         assert_eq!(
             AlertState::default().evaluate(&settings, &data, 100).len(),
             1
@@ -421,5 +476,46 @@ mod tests {
         assert!(!settings.enabled);
         assert!(settings.session && settings.weekly);
         assert_eq!(settings.thresholds, vec![80, 90, 95]);
+    }
+
+    #[test]
+    fn unavailable_windows_and_stale_readings_never_consume_alerts() {
+        let settings = SettingsFile::default();
+        let mut reading = UsageData {
+            session: usage(95.0, Some(1000)),
+            ..Default::default()
+        };
+        let mut state = AlertState::default();
+        for (available, stale) in [(false, false), (true, true)] {
+            reading.session.available = available;
+            reading.stale = stale;
+            let data: AppUsageData = [(ProviderId::Claude, reading.clone())]
+                .into_iter()
+                .collect();
+            assert!(state.evaluate(&settings, &data, 100).is_empty());
+        }
+        reading.session.available = true;
+        reading.stale = false;
+        let data: AppUsageData = [(ProviderId::Claude, reading)].into_iter().collect();
+        assert_eq!(state.evaluate(&settings, &data, 100).len(), 1);
+    }
+
+    #[test]
+    fn upgrading_default_account_keeps_consumed_thresholds() {
+        let mut state = AlertState::default();
+        state
+            .windows
+            .entry("codex:codex_local/session".into())
+            .or_default()
+            .evaluate(&usage(95.0, Some(1000)), &[80, 90, 95], 100);
+        state.migrate_default_windows(ProviderId::Codex, &Default::default(), "codex:default");
+        assert_eq!(
+            state
+                .windows
+                .get_mut("codex:default/session")
+                .unwrap()
+                .evaluate(&usage(95.0, Some(1000)), &[80, 90, 95], 100),
+            None
+        );
     }
 }

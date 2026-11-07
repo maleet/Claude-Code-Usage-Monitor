@@ -3,12 +3,14 @@
 mod accounts;
 mod alerts;
 mod app_settings;
-mod codex_oauth;
 mod context_menu;
 mod dashboard;
 mod desktop_compositor;
 mod diagnose;
 mod font_catalog;
+#[cfg(test)]
+mod https_test;
+mod known_folders;
 mod localization;
 mod models;
 mod native_interop;
@@ -21,10 +23,13 @@ mod theme_package;
 mod tray_icon;
 mod ui;
 mod updater;
+mod widget_font;
 mod window;
 mod winsqlite;
 
 fn main() {
+    diagnose::install_panic_hook();
+
     let args: Vec<String> = std::env::args().collect();
     let diagnose_enabled = args.iter().any(|arg| arg == "--diagnose");
     if diagnose_enabled {

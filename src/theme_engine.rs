@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
@@ -19,19 +20,31 @@ use crate::providers::{ProviderId, ProviderSet, PROVIDER_DESCRIPTORS};
 
 pub const THEME_SCHEMA_VERSION: u32 = 1;
 pub const CLASSIC_THEME_ID: &str = "classic-usage-widget";
+pub const COMPACT_FLUENT_QUAD_THEME_ID: &str = "compact-fluent-quad";
+pub const CLASSIC_VERTICAL_THEME_ID: &str = "classic-vertical";
 pub const MINECRAFT_THEME_ID: &str = "theme-minecraft";
 
-const BUILTIN_THEME_SOURCES: &[(&str, &str)] = &[(
-    CLASSIC_THEME_ID,
-    include_str!("themes/classic-usage-widget.json"),
-)];
+const BUILTIN_THEME_SOURCES: &[(&str, &str)] = &[
+    (
+        CLASSIC_THEME_ID,
+        include_str!(concat!(env!("OUT_DIR"), "/classic-usage-widget.json")),
+    ),
+    (
+        COMPACT_FLUENT_QUAD_THEME_ID,
+        include_str!(concat!(env!("OUT_DIR"), "/compact-fluent-quad.json")),
+    ),
+    (
+        CLASSIC_VERTICAL_THEME_ID,
+        include_str!(concat!(env!("OUT_DIR"), "/classic-vertical.json")),
+    ),
+];
 
 /// Bundled starting points are copied into the managed library only when they
 /// are missing. Their ids are deliberately excluded from `is_builtin_theme_id`
 /// so users can edit, rename, export, or delete them in Theme Studio.
 const BUNDLED_EDITABLE_THEME_SOURCES: &[(&str, &str)] = &[(
     MINECRAFT_THEME_ID,
-    include_str!("themes/minecraft-codex.json"),
+    include_str!(concat!(env!("OUT_DIR"), "/minecraft-codex.json")),
 )];
 const BUNDLED_EDITABLE_INSTALL_MARKER: &str = ".minecraft-theme-installed";
 
@@ -118,6 +131,9 @@ pub struct SceneObject {
     pub border: Option<Stroke>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse_events: Option<MouseEvents>,
+    /// Native hover popup for a root surface. Omitted by older/custom themes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tooltip: Option<SurfaceTooltip>,
     #[serde(default)]
     pub corner_radius: Expression,
     #[serde(default)]
@@ -151,6 +167,12 @@ pub struct Canvas {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Placement {
+    /// Runtime-only layout host retained during undocking; never edits the theme.
+    #[serde(skip)]
+    pub host_dimensions: Option<(u32, u32)>,
+    /// Runtime-only protection for drag anchoring; authored placements stay exact.
+    #[serde(skip)]
+    pub clamp_taskbar_drag: bool,
     #[serde(default)]
     pub reference: ReferenceTarget,
     /// Controls which native shell host owns a root surface. Older themes did
@@ -213,6 +235,12 @@ pub enum SurfaceNest {
     TrayIcon,
     Desktop,
     Floating,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceTooltip {
+    UsageSummary,
 }
 
 impl SurfaceNest {
@@ -306,6 +334,7 @@ impl SceneObject {
             background: LayerBackground::default(),
             border: None,
             mouse_events: None,
+            tooltip: None,
             corner_radius: 0.0.into(),
             layout: ChildLayout::Freeform,
             align: ChildAlignment::Start,
@@ -444,6 +473,9 @@ pub enum MouseActionTarget {
 pub enum MouseAction {
     ShowDashboard,
     ToggleDashboard,
+    OpenUrl {
+        url: String,
+    },
     ShowContextMenu {
         menu: Option<String>,
     },
@@ -483,12 +515,14 @@ pub struct MouseActionOverrideKey {
 pub enum MouseActionEffect {
     ShowDashboard,
     ToggleDashboard,
+    OpenUrl(String),
     ShowContextMenu(Option<String>),
 }
 
 /// Parse the deliberately small, line-or-semicolon separated action language.
 /// Supported forms include `show_dashboard()`, `toggle_dashboard()`,
-/// `show_context_menu()`, `show_context_menu("menu-id")`, `set(self.render, false)`,
+/// `open_url("https://example.com")`, `show_context_menu()`,
+/// `show_context_menu("menu-id")`, `set(self.render, false)`,
 /// `increase("layer-id", height, 10)`, `decrease(self.width, 5)`,
 /// `toggle(self.render)`, and `reset("layer-id", height)`.
 pub fn parse_mouse_actions(source: &str) -> Result<Vec<MouseAction>, String> {
@@ -508,6 +542,14 @@ pub fn parse_mouse_actions(source: &str) -> Result<Vec<MouseAction>, String> {
             "show_dashboard" => return Err("show_dashboard() does not take arguments".into()),
             "toggle_dashboard" if args.is_empty() => actions.push(MouseAction::ToggleDashboard),
             "toggle_dashboard" => return Err("toggle_dashboard() does not take arguments".into()),
+            "open_url" if args.len() == 1 => {
+                let url = parse_quoted_action_string(&args[0], "URL")?;
+                if !crate::context_menu::supported_url(&url) {
+                    return Err("open_url URL must start with http:// or https://".into());
+                }
+                actions.push(MouseAction::OpenUrl { url });
+            }
+            "open_url" => return Err("open_url expects one quoted URL".into()),
             "show_context_menu" if args.is_empty() => {
                 actions.push(MouseAction::ShowContextMenu { menu: None })
             }
@@ -697,6 +739,120 @@ fn split_action_arguments(source: &str) -> Result<Vec<String>, String> {
     }
     result.push(current.trim().to_string());
     Ok(result)
+}
+
+/// How text inserted into an action value must be written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionValue {
+    /// Directly in an action script.
+    Bare,
+    /// Inside the quoted script of a context menu `layer_actions("…")`, where
+    /// quotes and backslashes are escaped.
+    Quoted,
+}
+
+/// Whether byte offset `caret` in an action script falls in the value of a
+/// `set`, `increase` or `decrease` action, where any expression is accepted.
+/// The script inside a context menu `layer_actions("…")` is searched too.
+pub fn action_value_at(source: &str, caret: usize) -> Option<ActionValue> {
+    let (name, args, index) = action_argument_at(source, caret)?;
+    match name.as_str() {
+        "set" | "increase" | "decrease" => {
+            (index > 0 && index + 1 == args.len()).then_some(ActionValue::Bare)
+        }
+        "layer_actions" => {
+            let argument = args[index].clone();
+            let open = argument.start + source[argument.clone()].find('"')?;
+            let close = source[open + 1..argument.end]
+                .rfind('"')
+                .map_or(argument.end, |offset| open + 1 + offset);
+            if caret <= open || caret > close {
+                return None;
+            }
+            let before = unescape_action_string(&source[open + 1..caret])?;
+            let script = before.clone() + &unescape_action_string(&source[caret..close])?;
+            action_value_at(&script, before.len()).map(|_| ActionValue::Quoted)
+        }
+        _ => None,
+    }
+}
+
+/// The action call around byte offset `caret`: its lowercase name, the byte
+/// ranges of its arguments, and the index of the argument holding the caret.
+fn action_argument_at(
+    source: &str,
+    caret: usize,
+) -> Option<(String, Vec<std::ops::Range<usize>>, usize)> {
+    let mut statement = 0;
+    let mut open = None;
+    let mut args = Vec::new();
+    let mut argument = 0;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in source.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            _ if quoted => {}
+            '(' => {
+                if depth == 0 {
+                    open = Some(index);
+                    argument = index + 1;
+                }
+                depth += 1;
+            }
+            ',' if depth == 1 => {
+                args.push(argument..index);
+                argument = index + 1;
+            }
+            ')' if depth == 1 => {
+                args.push(argument..index);
+                depth = 0;
+                if caret <= index {
+                    break;
+                }
+            }
+            ')' => depth = depth.saturating_sub(1),
+            ';' | '\n' | '\r' if depth == 0 => {
+                if caret <= index {
+                    break;
+                }
+                statement = index + 1;
+                open = None;
+                args.clear();
+            }
+            _ => {}
+        }
+    }
+    let open = open.filter(|open| *open >= statement && *open < caret)?;
+    if depth > 0 {
+        args.push(argument..source.len());
+    }
+    let index = args
+        .iter()
+        .position(|range| range.start <= caret && caret <= range.end)?;
+    let name = source[statement..open].trim().to_ascii_lowercase();
+    Some((name, args, index))
+}
+
+/// Reverses the escaping of a quoted action string, or `None` when `source`
+/// ends partway through an escape.
+fn unescape_action_string(source: &str) -> Option<String> {
+    let mut result = String::with_capacity(source.len());
+    let mut characters = source.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            result.push(characters.next()?);
+        } else {
+            result.push(character);
+        }
+    }
+    Some(result)
 }
 
 fn parse_target_property(source: &str) -> Result<(MouseActionTarget, MouseActionProperty), String> {
@@ -927,6 +1083,8 @@ struct SceneObjectWire {
     #[serde(default)]
     mouse_events: Option<MouseEvents>,
     #[serde(default)]
+    tooltip: Option<SurfaceTooltip>,
+    #[serde(default)]
     corner_radius: Expression,
     #[serde(default)]
     layout: ChildLayout,
@@ -1010,6 +1168,7 @@ impl<'de> Deserialize<'de> for SceneObject {
             background: wire.background,
             border: wire.border,
             mouse_events: wire.mouse_events,
+            tooltip: wire.tooltip,
             corner_radius: wire.corner_radius,
             layout: wire.layout,
             align: wire.align,
@@ -1145,6 +1304,7 @@ pub struct ResolvedObject<'a> {
     pub height: f64,
     pub parent_width: f64,
     pub parent_height: f64,
+    pub gap: f64,
     pub opacity: f64,
     pub rotation: f64,
     pub clip: Vec<ClipRegion>,
@@ -1172,17 +1332,30 @@ pub struct RenderedTheme {
 pub struct DataContext {
     values: HashMap<String, f64>,
     strings: HashMap<String, String>,
+    force_segoe_ui: bool,
 }
 
-/// Settings-controlled provider state used by theme expressions and layout.
-/// This is deliberately independent of polling availability so a temporary
-/// provider error never causes the widget to jump or resize.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Runtime environment used by theme expressions and layout. Provider state is
+/// deliberately independent of polling availability so a temporary provider
+/// error never causes the widget to jump or resize.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ThemeRuntime {
     providers: ProviderSet,
     pub poll_ok: bool,
     pub has_error: bool,
     pub language: LanguageId,
+    /// Present each allowance as what is left rather than what is spent. Only
+    /// the `.display` values and summaries using them follow this; `.percentage`
+    /// always means consumption so severity thresholds keep their meaning.
+    pub countdown: bool,
+    pub use_windows_default_font: bool,
+    pub surface_nest: SurfaceNest,
+    pub floating_card_opacity: u8,
+    pub antigravity_gemini_enabled: bool,
+    pub antigravity_external_enabled: bool,
+    pub crossfade_opacity: f64,
+    host_width: u32,
+    host_height: u32,
 }
 
 impl Default for ThemeRuntime {
@@ -1192,6 +1365,15 @@ impl Default for ThemeRuntime {
             poll_ok: true,
             has_error: false,
             language: LanguageId::English,
+            countdown: false,
+            use_windows_default_font: true,
+            surface_nest: SurfaceNest::Taskbar,
+            floating_card_opacity: 85,
+            antigravity_gemini_enabled: true,
+            antigravity_external_enabled: false,
+            crossfade_opacity: 1.0,
+            host_width: default_canvas_width(),
+            host_height: default_canvas_height(),
         }
     }
 }
@@ -1212,12 +1394,44 @@ impl ThemeRuntime {
     }
 
     pub fn from_providers(providers: ProviderSet) -> Self {
+        let agy = providers.contains(ProviderId::Antigravity);
         Self {
             providers,
             poll_ok: true,
             has_error: false,
             language: LanguageId::English,
+            countdown: false,
+            use_windows_default_font: true,
+            surface_nest: SurfaceNest::Taskbar,
+            floating_card_opacity: 85,
+            antigravity_gemini_enabled: agy,
+            antigravity_external_enabled: false,
+            crossfade_opacity: 1.0,
+            host_width: default_canvas_width(),
+            host_height: default_canvas_height(),
         }
+    }
+
+    pub fn with_antigravity_pools(
+        mut self,
+        gemini: bool,
+        external: bool,
+        crossfade_opacity: f64,
+    ) -> Self {
+        self.antigravity_gemini_enabled = gemini;
+        self.antigravity_external_enabled = external;
+        self.crossfade_opacity = crossfade_opacity;
+        self
+    }
+
+    pub fn with_nest(mut self, nest: SurfaceNest) -> Self {
+        self.surface_nest = nest;
+        self
+    }
+
+    pub fn with_floating_card_opacity(mut self, opacity: u8) -> Self {
+        self.floating_card_opacity = opacity;
+        self
     }
 
     pub fn with_poll_state(mut self, poll_ok: bool, has_error: bool) -> Self {
@@ -1229,6 +1443,29 @@ impl ThemeRuntime {
     pub fn with_language(mut self, language: LanguageId) -> Self {
         self.language = language;
         self
+    }
+
+    /// Count each allowance down towards its limit instead of up from zero.
+    pub fn with_countdown(mut self, countdown: bool) -> Self {
+        self.countdown = countdown;
+        self
+    }
+
+    pub fn with_windows_default_font(mut self, enabled: bool) -> Self {
+        self.use_windows_default_font = enabled;
+        self
+    }
+
+    /// Supply the selected native host's 96-DPI logical dimensions. Theme
+    /// expressions consume these as `host.width` and `host.height`.
+    pub fn with_host_dimensions(mut self, width: u32, height: u32) -> Self {
+        self.host_width = width.max(1);
+        self.host_height = height.max(1);
+        self
+    }
+
+    pub fn host_dimensions(self) -> (u32, u32) {
+        (self.host_width, self.host_height)
     }
 
     pub fn provider_count(self) -> usize {
@@ -1250,11 +1487,16 @@ impl DataContext {
         canvas: &Canvas,
         runtime: ThemeRuntime,
     ) -> Self {
-        let mut context = Self::default();
+        let mut context = Self {
+            force_segoe_ui: !runtime.use_windows_default_font,
+            ..Self::default()
+        };
         context.insert("canvas.width", canvas.width as f64);
         context.insert("canvas.height", canvas.height as f64);
         context.insert("parent.width", canvas.width as f64);
         context.insert("parent.height", canvas.height as f64);
+        context.insert("host.width", runtime.host_width as f64);
+        context.insert("host.height", runtime.host_height as f64);
         context.insert("pi", std::f64::consts::PI);
         context.insert("e", std::f64::consts::E);
         context.insert("true", 1.0);
@@ -1274,6 +1516,7 @@ impl DataContext {
             (!runtime.poll_ok && !runtime.has_error) as u8 as f64,
         );
         let strings = runtime.language.strings();
+        context.insert_string("i18n.locale", runtime.language.code());
         context.insert_string("i18n.session_window", strings.session_window);
         context.insert_string("i18n.weekly_window", strings.weekly_window);
         context.insert_string("i18n.cursor_auto_window", strings.cursor_auto_window);
@@ -1284,95 +1527,293 @@ impl DataContext {
         context.insert_string("i18n.minute_suffix", strings.minute_suffix);
         context.insert_string("i18n.second_suffix", strings.second_suffix);
         context.insert("providers.count", runtime.provider_count() as f64);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_secs_f64())
+            .unwrap_or(0.0);
+        context.insert("time.now.unix", now);
+        context.insert("time.now.milliseconds", now * 1000.0);
+        for (zone, local) in [("local", true), ("utc", false)] {
+            if let Some(value) = timestamp_parts(now, local) {
+                for (component, value) in [
+                    ("year", value.year),
+                    ("month", value.month),
+                    ("day", value.day),
+                    ("weekday", value.weekday),
+                    ("hour", value.hour),
+                    ("minute", value.minute),
+                    ("second", value.second),
+                ] {
+                    context.insert(&format!("time.{zone}.{component}"), f64::from(value));
+                }
+            }
+        }
         for descriptor in PROVIDER_DESCRIPTORS {
+            context.insert_string(&format!("{}.account.name", descriptor.key), "");
             context.insert(
                 &format!("providers.{}.enabled", descriptor.key),
                 runtime.provider_enabled(descriptor.id) as u8 as f64,
             );
         }
+        context.insert("display.countdown", runtime.countdown as u8 as f64);
+        context.insert(
+            "antigravity.gemini.enabled",
+            runtime.antigravity_gemini_enabled as u8 as f64,
+        );
+        context.insert(
+            "antigravity.external.enabled",
+            runtime.antigravity_external_enabled as u8 as f64,
+        );
+        let agy_dual_mode =
+            runtime.antigravity_gemini_enabled && runtime.antigravity_external_enabled;
+        context.insert("antigravity.dual_mode", agy_dual_mode as u8 as f64);
+        context.insert(
+            "antigravity.crossfade_opacity",
+            runtime.crossfade_opacity.clamp(0.0, 1.0),
+        );
         if let Some(data) = data {
+            for account in &data.accounts {
+                let key = format!(
+                    "accounts.{}.{}",
+                    account.provider.descriptor().key,
+                    account.profile.id
+                );
+                context.insert_string(&format!("{key}.name"), &account.profile.name);
+                context.insert(&format!("{key}.selected"), account.selected as u8 as f64);
+                context.insert(
+                    &format!("{key}.has_error"),
+                    account.error.is_some() as u8 as f64,
+                );
+                context.insert_provider(
+                    &key,
+                    account.usage.as_ref(),
+                    account.provider == ProviderId::Codex,
+                    runtime.countdown,
+                );
+            }
             for descriptor in PROVIDER_DESCRIPTORS {
-                context.insert_provider(descriptor.key, data.get(descriptor.id));
+                if let Some(account) = data
+                    .accounts
+                    .iter()
+                    .find(|account| account.provider == descriptor.id && account.selected)
+                {
+                    context.insert(
+                        &format!("{}.has_error", descriptor.key),
+                        account.error.is_some() as u8 as f64,
+                    );
+                }
+                context.insert_string(
+                    &format!("{}.account.name", descriptor.key),
+                    data.selected_account_name(descriptor.id).unwrap_or(""),
+                );
+                context.insert_provider(
+                    descriptor.key,
+                    data.get(descriptor.id),
+                    descriptor.id == ProviderId::Codex,
+                    runtime.countdown,
+                );
+            }
+            if let Some(agy) = data.get(ProviderId::Antigravity) {
+                // Antigravity answered this poll; pool-level gaps are "no limit
+                // data" ("--"), not a provider error.
+                context.insert("antigravity.reported", 1.0);
+                context.insert_provider("antigravity.gemini", Some(agy), false, runtime.countdown);
+                // A missing external pool stays empty ("--"); never show Gemini figures in its place.
+                context.insert_provider(
+                    "antigravity.external",
+                    agy.external_pool.as_deref(),
+                    false,
+                    runtime.countdown,
+                );
+            } else {
+                context.insert_provider("antigravity.gemini", None, false, runtime.countdown);
+                context.insert_provider("antigravity.external", None, false, runtime.countdown);
             }
             let active = ProviderId::ALL
                 .into_iter()
-                .find_map(|provider| data.get(provider));
-            context.insert_provider("active", active);
+                .find_map(|provider| data.get(provider).map(|usage| (provider, usage)));
+            context.insert_provider(
+                "active",
+                active.map(|(_, usage)| usage),
+                active.is_some_and(|(provider, _)| provider == ProviderId::Codex),
+                runtime.countdown,
+            );
         } else {
             for descriptor in PROVIDER_DESCRIPTORS {
-                context.insert_provider(descriptor.key, None);
-            }
-            context.insert_provider("active", None);
-        }
-        if let Some(data) = data {
-            let enabled = runtime.provider_enabled(ProviderId::Codex);
-            context.insert(
-                "accounts.count",
-                if enabled {
-                    data.account_order.iter().filter(|a| a.visible).count() as f64
-                } else {
-                    0.0
-                },
-            );
-            for account in &data.account_order {
-                let key = format!("accounts.{}", account.id);
-                let entry = data.accounts.get(&account.id);
-                context.insert_provider(&key, entry.and_then(|e| e.usage.as_ref()));
-                context.insert_string(&format!("{key}.name"), &account.name);
-                context.insert_string(&format!("{key}.color"), &account.color);
-                context.insert_string(&format!("{key}.identity"), &account.identity);
-                context.insert_string(
-                    &format!("{key}.status"),
-                    entry
-                        .and_then(|e| e.error.as_deref())
-                        .map(|error| match error {
-                            "Sign in again" => runtime.language.text("Sign in again"),
-                            _ => runtime.language.text("Unable to refresh usage"),
-                        })
-                        .unwrap_or_else(|| {
-                            runtime
-                                .language
-                                .text(if entry.is_some_and(|e| e.usage.is_some()) {
-                                    "Connected"
-                                } else {
-                                    "Waiting for usage"
-                                })
-                        }),
-                );
-                context.insert(
-                    &format!("{key}.enabled"),
-                    (enabled && account.visible) as u8 as f64,
-                );
-                context.insert(
-                    &format!("{key}.has_error"),
-                    entry.is_some_and(|e| e.error.is_some()) as u8 as f64,
-                );
-                context.insert(
-                    &format!("{key}.updated_unix"),
-                    entry.map_or(0, |e| e.updated_unix) as f64,
+                context.insert_provider(
+                    descriptor.key,
+                    None,
+                    descriptor.id == ProviderId::Codex,
+                    runtime.countdown,
                 );
             }
-        } else {
-            context.insert("accounts.count", 0.0);
+            context.insert_provider("antigravity.gemini", None, false, runtime.countdown);
+            context.insert_provider("antigravity.external", None, false, runtime.countdown);
+            context.insert_provider("active", None, false, runtime.countdown);
         }
         context
     }
 
-    fn insert_provider(&mut self, name: &str, usage: Option<&crate::models::UsageData>) {
+    fn insert_provider(
+        &mut self,
+        name: &str,
+        usage: Option<&crate::models::UsageData>,
+        codex_compatibility: bool,
+        countdown: bool,
+    ) {
+        // What a gauge or a badge should show. `percentage` stays the share
+        // that has been spent so warning thresholds keep working, while
+        // `display` follows the countdown setting.
+        self.insert_limits(name, usage, countdown);
+        let display = |percentage: f64| {
+            if countdown {
+                100.0 - percentage
+            } else {
+                percentage
+            }
+        };
         let weekly_label = usage
             .and_then(|usage| usage.weekly_label.as_deref())
             .or_else(|| self.get_string("i18n.weekly_window"))
             .unwrap_or("7d")
             .to_string();
         self.insert_string(&format!("{name}.weekly.label"), weekly_label);
-        let (session, weekly) = usage
+        let session_label = usage
+            .and_then(|usage| usage.session_label.as_deref())
+            .or_else(|| self.get_string("i18n.session_window"))
+            .unwrap_or("5h")
+            .to_string();
+        self.insert_string(&format!("{name}.session.label"), session_label);
+        let (five_hour, weekly) = usage
             .map(|usage| (usage.session.percentage, usage.weekly.percentage))
             .unwrap_or((0.0, 0.0));
+        // Before Codex windows were classified by duration, a weekly-only
+        // response arrived in the primary slot and was exposed to themes as
+        // `codex.session`. Keep that established binding working for existing
+        // custom themes, while `codex.five_hour` always means the real window.
+        let use_codex_session_fallback = codex_compatibility
+            && usage.is_some_and(|usage| !usage.session.available && usage.weekly.available);
+        let session = if use_codex_session_fallback {
+            weekly
+        } else {
+            five_hour
+        };
+        let (session_available, weekly_available) = usage
+            .map(|usage| {
+                (
+                    usage.session.available || use_codex_session_fallback,
+                    usage.weekly.available,
+                )
+            })
+            .unwrap_or((false, false));
+        self.insert(
+            &format!("{name}.session.available"),
+            session_available as u8 as f64,
+        );
+        self.insert(
+            &format!("{name}.five_hour.available"),
+            usage.is_some_and(|usage| usage.session.available) as u8 as f64,
+        );
+        self.insert(
+            &format!("{name}.weekly.available"),
+            weekly_available as u8 as f64,
+        );
         self.insert(&format!("{name}.session.percentage"), session);
         self.insert(&format!("{name}.session.remaining"), 100.0 - session);
+        // An Antigravity pool window that was not reported draws an empty
+        // gauge in either usage direction instead of a full "remaining" one.
+        let shown_session = if name.starts_with("antigravity") && !session_available {
+            0.0
+        } else {
+            display(session)
+        };
+        self.insert(&format!("{name}.session.display"), shown_session);
+        self.insert(&format!("{name}.five_hour.percentage"), five_hour);
+        self.insert(&format!("{name}.five_hour.remaining"), 100.0 - five_hour);
+        // An Antigravity pool window that was not reported draws an empty
+        // gauge in either usage direction instead of a full "remaining" one.
+        let shown_five_hour = if name.starts_with("antigravity")
+            && !usage.is_some_and(|usage| usage.session.available)
+        {
+            0.0
+        } else {
+            display(five_hour)
+        };
+        self.insert(&format!("{name}.five_hour.display"), shown_five_hour);
         self.insert(&format!("{name}.weekly.percentage"), weekly);
         self.insert(&format!("{name}.weekly.remaining"), 100.0 - weekly);
+        // An Antigravity pool window that was not reported draws an empty
+        // gauge in either usage direction instead of a full "remaining" one.
+        let shown_weekly = if name.starts_with("antigravity") && !weekly_available {
+            0.0
+        } else {
+            display(weekly)
+        };
+        self.insert(&format!("{name}.weekly.display"), shown_weekly);
+        let monthly = usage.and_then(|usage| usage.monthly.as_ref());
+        self.insert_string(&format!("{name}.monthly.label"), "30d");
+        if let Some(monthly) = monthly {
+            self.insert(&format!("{name}.monthly.percentage"), monthly.percentage);
+            self.insert(
+                &format!("{name}.monthly.remaining"),
+                100.0 - monthly.percentage,
+            );
+            self.insert(
+                &format!("{name}.monthly.display"),
+                display(monthly.percentage),
+            );
+        } else {
+            self.insert(&format!("{name}.monthly.percentage"), 0.0);
+            self.insert(&format!("{name}.monthly.remaining"), 100.0);
+            self.insert(&format!("{name}.monthly.display"), display(0.0));
+        }
+        self.insert(
+            &format!("{name}.monthly.available"),
+            monthly.is_some() as u8 as f64,
+        );
         self.insert(&format!("{name}.available"), usage.is_some() as u8 as f64);
+        // Carried over from an earlier poll: real figures, not current ones.
+        self.insert(
+            &format!("{name}.stale"),
+            usage.is_some_and(|usage| usage.stale) as u8 as f64,
+        );
+        // Credits are absent for most accounts, so `credits.available` is what
+        // a theme should gate the overlay on rather than `available`.
+        let credits = usage.and_then(|usage| usage.credits.as_ref());
+        let credits_percentage = credits.map(|credits| credits.percentage).unwrap_or(0.0);
+        self.insert(&format!("{name}.credits.percentage"), credits_percentage);
+        self.insert(
+            &format!("{name}.credits.remaining"),
+            100.0 - credits_percentage,
+        );
+        self.insert(
+            &format!("{name}.credits.display"),
+            display(credits_percentage),
+        );
+        // Currency, unlike the percentages either side of it.
+        self.insert(
+            &format!("{name}.credits.balance"),
+            credits.map(|credits| credits.remaining).unwrap_or(0.0),
+        );
+        self.insert(
+            &format!("{name}.credits.total"),
+            credits.map(|credits| credits.total).unwrap_or(0.0),
+        );
+        self.insert(
+            &format!("{name}.credits.available"),
+            credits.is_some() as u8 as f64,
+        );
+        // The single figure a badge should show: whatever is closest to its
+        // limit. A provider can switch a window off entirely -- Codex has its
+        // five-hour window disabled -- so binding a badge to one window alone
+        // leaves it reporting 0% while another allowance is spent.
+        let headline = match credits {
+            Some(credits) => credits.percentage,
+            None => five_hour.max(weekly),
+        };
+        self.insert(&format!("{name}.headline.percentage"), headline);
+        self.insert(&format!("{name}.headline.remaining"), 100.0 - headline);
+        self.insert(&format!("{name}.headline.display"), display(headline));
         let reset_value = |reset: Option<std::time::SystemTime>| {
             let unix = reset
                 .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
@@ -1384,13 +1825,41 @@ impl DataContext {
                 .unwrap_or(0.0);
             (unix, seconds)
         };
-        let (session_unix, session_seconds) =
+        let (five_hour_unix, five_hour_seconds) =
             reset_value(usage.and_then(|value| value.session.resets_at));
         let (weekly_unix, weekly_seconds) =
             reset_value(usage.and_then(|value| value.weekly.resets_at));
+        let (session_unix, session_seconds) = if use_codex_session_fallback {
+            (weekly_unix, weekly_seconds)
+        } else {
+            (five_hour_unix, five_hour_seconds)
+        };
+        let five_hour_available = usage.is_some_and(|value| value.session.available);
+        let weekly_available = usage.is_some_and(|value| value.weekly.available);
+        let session_available = if use_codex_session_fallback {
+            weekly_available
+        } else {
+            five_hour_available
+        };
+        // Presence is independent of percentage and reset times. Monthly
+        // availability remains based on its explicitly optional section.
+        for (window, available) in [
+            ("session", session_available),
+            ("five_hour", five_hour_available),
+            ("weekly", weekly_available),
+        ] {
+            self.insert(
+                &format!("{name}.{window}.available"),
+                available as u8 as f64,
+            );
+        }
+        let (monthly_unix, monthly_seconds) =
+            reset_value(monthly.and_then(|value| value.resets_at));
         for (window, unix, seconds) in [
             ("session", session_unix, session_seconds),
+            ("five_hour", five_hour_unix, five_hour_seconds),
             ("weekly", weekly_unix, weekly_seconds),
+            ("monthly", monthly_unix, monthly_seconds),
         ] {
             self.insert(&format!("{name}.{window}.reset.unix"), unix);
             self.insert(&format!("{name}.{window}.reset.seconds"), seconds);
@@ -1404,27 +1873,37 @@ impl DataContext {
         self.values.insert(name.to_ascii_lowercase(), value);
     }
 
+    /// Whether a Builder catalogue can be reused. Clock rows are refreshed
+    /// separately because the fractional Unix timestamp changes every frame.
+    pub(crate) fn same_catalogue_data(&self, other: &Self) -> bool {
+        self.strings == other.strings
+            && self.values.len() == other.values.len()
+            && self.values.iter().all(|(name, value)| {
+                other.values.get(name).is_some_and(|other| {
+                    name.starts_with("time.") || value.to_bits() == other.to_bits()
+                })
+            })
+    }
+
     pub fn get(&self, name: &str) -> Option<f64> {
         let name = name.to_ascii_lowercase();
-        self.values.get(&name).copied().or_else(|| {
-            let field = account_field(&name)?;
-            if matches!(
-                field,
-                "enabled" | "has_error" | "available" | "updated_unix"
-            ) {
-                return Some(0.0);
-            }
-            let (window, metric) = field.split_once('.')?;
-            if !matches!(window, "session" | "weekly") {
-                return None;
-            }
-            match metric {
-                "percentage" | "reset.unix" | "reset.seconds" | "reset.minutes" | "reset.hours"
-                | "reset.days" => Some(0.0),
-                "remaining" => Some(100.0),
-                _ => None,
-            }
-        })
+        self.values
+            .get(&name)
+            .copied()
+            .or_else(|| self.limit_default(&name))
+            .or_else(|| {
+                let key = Self::account_default_key(&name)?;
+                let value = *Self::account_defaults().values.get(&key)?;
+                Some(
+                    if key.ends_with(".display")
+                        && self.values.get("display.countdown").copied().unwrap_or(0.0) != 0.0
+                    {
+                        100.0 - value
+                    } else {
+                        value
+                    },
+                )
+            })
     }
 
     pub fn insert_string(&mut self, name: &str, value: impl Into<String>) {
@@ -1432,30 +1911,44 @@ impl DataContext {
     }
 
     pub fn get_string(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
         self.strings
-            .get(&name.to_ascii_lowercase())
+            .get(&name)
             .map(String::as_str)
-            .or_else(|| match account_field(name)? {
-                "name" => Some("Codex"),
-                "color" => Some("#808080FF"),
-                "identity" | "status" => Some(""),
-                "weekly.label" => Some("7d"),
-                _ => None,
+            .or_else(|| Self::limit_string_default(&name))
+            .or_else(|| {
+                let key = Self::account_default_key(&name)?;
+                Self::account_defaults()
+                    .strings
+                    .get(&key)
+                    .map(String::as_str)
             })
     }
 
-    pub fn account_names(&self) -> Vec<(String, String)> {
-        let mut accounts: Vec<_> = self
-            .strings
-            .iter()
-            .filter_map(|(key, name)| {
-                key.strip_prefix("accounts.")
-                    .and_then(|key| key.strip_suffix(".name"))
-                    .map(|id| (format!("accounts.{id}"), name.clone()))
-            })
-            .collect();
-        accounts.sort();
-        accounts
+    // Account IDs are dynamic, but their fields use the same schema as provider
+    // bindings. Supply typed defaults during validation, startup and removal;
+    // unknown fields must still report typos instead of silently becoming zero.
+    fn account_default_key(name: &str) -> Option<String> {
+        let (provider, rest) = name.strip_prefix("accounts.")?.split_once('.')?;
+        let (id, field) = rest.split_once('.')?;
+        (matches!(provider, "claude" | "codex")
+            && !id.is_empty()
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+        .then(|| format!("account.{field}"))
+    }
+
+    fn account_defaults() -> &'static Self {
+        static DEFAULTS: OnceLock<DataContext> = OnceLock::new();
+        DEFAULTS.get_or_init(|| {
+            let mut context = Self::default();
+            context.insert_provider("account", None, false, false);
+            context.insert_string("account.name", "");
+            context.insert("account.selected", 0.0);
+            context.insert("account.has_error", 0.0);
+            context
+        })
     }
 
     pub fn with_object(mut self, object: &ResolvedObject<'_>) -> Self {
@@ -1463,18 +1956,15 @@ impl DataContext {
         self.insert("object.y", object.y);
         self.insert("object.width", object.width);
         self.insert("object.height", object.height);
+        self.insert("this.x", object.x);
+        self.insert("this.y", object.y);
+        self.insert("this.width", object.width);
+        self.insert("this.height", object.height);
+        self.insert("this.gap", object.gap);
         self.insert("parent.width", object.parent_width);
         self.insert("parent.height", object.parent_height);
         self
     }
-}
-
-fn account_field(name: &str) -> Option<&str> {
-    let (id, field) = name.strip_prefix("accounts.")?.split_once('.')?;
-    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-        return None;
-    }
-    Some(field)
 }
 
 fn action_target_id<'a>(target: &'a MouseActionTarget, self_id: &'a str) -> &'a str {
@@ -1585,6 +2075,7 @@ pub fn validate_mouse_action_script(
         let (target, property, value) = match action {
             MouseAction::ShowDashboard
             | MouseAction::ToggleDashboard
+            | MouseAction::OpenUrl { .. }
             | MouseAction::ShowContextMenu { .. } => continue,
             MouseAction::Set {
                 target,
@@ -1689,7 +2180,7 @@ fn mouse_action_object_context(
         .surfaces
         .get(surface_index)
         .ok_or_else(|| format!("Surface {surface_index} does not exist"))?;
-    let (width, height) = resolve_surface_size(theme, surface_index, data, runtime);
+    let (width, height) = resolve_surface_content_size(theme, surface_index, data, runtime);
     let canvas = Canvas {
         width,
         width_expression: Some(surface.width.clone()),
@@ -1790,6 +2281,7 @@ pub fn execute_mouse_actions(
         match action {
             MouseAction::ShowDashboard => effects.push(MouseActionEffect::ShowDashboard),
             MouseAction::ToggleDashboard => effects.push(MouseActionEffect::ToggleDashboard),
+            MouseAction::OpenUrl { url } => effects.push(MouseActionEffect::OpenUrl(url)),
             MouseAction::ShowContextMenu { menu } => {
                 effects.push(MouseActionEffect::ShowContextMenu(menu))
             }
@@ -1846,7 +2338,7 @@ pub fn execute_mouse_actions(
                 let surface = &effective.surfaces[target_surface_index];
                 let object_id = object.id.clone();
                 let (width, height) =
-                    resolve_surface_size(&effective, target_surface_index, data, runtime);
+                    resolve_surface_content_size(&effective, target_surface_index, data, runtime);
                 let canvas = Canvas {
                     width,
                     width_expression: Some(surface.width.clone()),
@@ -1872,6 +2364,16 @@ pub fn execute_mouse_actions(
 }
 
 impl ThemeDocument {
+    /// How often a live clock can visibly change. Minute-only clocks avoid the
+    /// much more expensive second-by-second surface rendering path.
+    pub fn current_time_refresh_interval(&self) -> Option<Duration> {
+        current_time_refresh_interval_for(self)
+    }
+
+    pub fn surface_current_time_refresh_interval(&self, surface_index: usize) -> Option<Duration> {
+        current_time_refresh_interval_for(self.surfaces.get(surface_index)?)
+    }
+
     pub fn is_builtin(&self) -> bool {
         is_builtin_theme_id(&self.id)
     }
@@ -2054,6 +2556,68 @@ impl ThemeDocument {
     }
 }
 
+fn current_time_refresh_interval_for(value: &impl Serialize) -> Option<Duration> {
+    let source = serde_json::to_string(value).ok()?.to_ascii_lowercase();
+    let uses_clock =
+        source.contains("time.now") || source.contains("time.local") || source.contains("time.utc");
+    if !uses_clock {
+        return None;
+    }
+
+    let needs_seconds = source.contains("time.now.milliseconds")
+        || source.contains("time.local.second")
+        || source.contains("time.utc.second")
+        || unix_clock_requires_second_refresh(&source);
+    Some(Duration::from_secs(if needs_seconds { 1 } else { 60 }))
+}
+
+fn unix_clock_requires_second_refresh(source: &str) -> bool {
+    let mut remaining = source;
+    while let Some(index) = remaining.find("time.now.unix") {
+        let after_clock = &remaining[index + "time.now.unix".len()..];
+        let Some(token_end) = after_clock.find('}') else {
+            return true;
+        };
+        let token_tail = &after_clock[..token_end];
+        let Some((_, format)) = token_tail.rsplit_once(':') else {
+            return true;
+        };
+        if !is_minute_or_slower_clock_format(format) {
+            return true;
+        }
+        remaining = &after_clock[token_end + 1..];
+    }
+    false
+}
+
+fn is_minute_or_slower_clock_format(format: &str) -> bool {
+    let format = format.trim().strip_prefix("utc_").unwrap_or(format.trim());
+    matches!(
+        format,
+        "weekday_2"
+            | "weekday_short"
+            | "weekday_long"
+            | "day"
+            | "day_2"
+            | "month"
+            | "month_2"
+            | "month_short"
+            | "month_long"
+            | "year_2"
+            | "year"
+            | "date"
+            | "date_short"
+            | "date_long"
+            | "time"
+            | "time_short"
+            | "time_24"
+            | "time_12"
+            | "am_pm"
+            | "datetime_short"
+            | "iso_date"
+    )
+}
+
 fn validate_scene_mouse_events(
     errors: &mut Vec<String>,
     context: &DataContext,
@@ -2082,6 +2646,13 @@ fn validate_scene_mouse_events(
 }
 
 fn validate_scene_object(errors: &mut Vec<String>, context: &DataContext, object: &SceneObject) {
+    let mut object_context = context.clone();
+    let gap = evaluate(&object.gap.0, context)
+        .ok()
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0)
+        .max(0.0);
+    object_context.insert("this.gap", gap);
     for (property, expression) in [
         ("render", &object.render),
         ("visibility", &object.visibility),
@@ -2095,7 +2666,11 @@ fn validate_scene_object(errors: &mut Vec<String>, context: &DataContext, object
     ] {
         validate_expression(
             errors,
-            context,
+            if property == "gap" {
+                context
+            } else {
+                &object_context
+            },
             &format!("{}.{}", object.name, property),
             expression,
         );
@@ -2104,26 +2679,26 @@ fn validate_scene_object(errors: &mut Vec<String>, context: &DataContext, object
         LayerBackground::None => {}
         LayerBackground::Colour { colour } => validate_paint(
             errors,
-            context,
+            &object_context,
             &format!("{}.background.colour", object.name),
             colour,
         ),
         LayerBackground::Gradient { start, end, angle } => {
             validate_paint(
                 errors,
-                context,
+                &object_context,
                 &format!("{}.background.gradient.start", object.name),
                 start,
             );
             validate_paint(
                 errors,
-                context,
+                &object_context,
                 &format!("{}.background.gradient.end", object.name),
                 end,
             );
             validate_expression(
                 errors,
-                context,
+                &object_context,
                 &format!("{}.background.gradient.angle", object.name),
                 angle,
             );
@@ -2137,13 +2712,13 @@ fn validate_scene_object(errors: &mut Vec<String>, context: &DataContext, object
     if let Some(border) = &object.border {
         validate_paint(
             errors,
-            context,
+            &object_context,
             &format!("{}.border", object.name),
             &border.color,
         );
         validate_expression(
             errors,
-            context,
+            &object_context,
             &format!("{}.border.width", object.name),
             &border.width,
         );
@@ -2159,18 +2734,23 @@ fn validate_scene_object(errors: &mut Vec<String>, context: &DataContext, object
         } => {
             validate_expression(
                 errors,
-                context,
+                &object_context,
                 &format!("{}.font_size", object.name),
                 font_size,
             );
             validate_expression(
                 errors,
-                context,
+                &object_context,
                 &format!("{}.contrast", object.name),
                 contrast,
             );
-            validate_paint(errors, context, &format!("{}.color", object.name), color);
-            for error in validate_template(template, context) {
+            validate_paint(
+                errors,
+                &object_context,
+                &format!("{}.color", object.name),
+                color,
+            );
+            for error in validate_template(template, &object_context) {
                 errors.push(format!("{}.template: {error}", object.name));
             }
         }
@@ -2190,7 +2770,7 @@ fn validate_scene_object(errors: &mut Vec<String>, context: &DataContext, object
             ] {
                 validate_expression(
                     errors,
-                    context,
+                    &object_context,
                     &format!("{}.{}", object.name, name),
                     expression,
                 );
@@ -2198,13 +2778,23 @@ fn validate_scene_object(errors: &mut Vec<String>, context: &DataContext, object
             if let Some(expression) = segments_expression {
                 validate_expression(
                     errors,
-                    context,
+                    &object_context,
                     &format!("{}.segments", object.name),
                     expression,
                 );
             }
-            validate_paint(errors, context, &format!("{}.fill", object.name), fill);
-            validate_paint(errors, context, &format!("{}.track", object.name), track);
+            validate_paint(
+                errors,
+                &object_context,
+                &format!("{}.fill", object.name),
+                fill,
+            );
+            validate_paint(
+                errors,
+                &object_context,
+                &format!("{}.track", object.name),
+                track,
+            );
         }
     }
 }
@@ -2221,7 +2811,7 @@ fn validate_expression(
 }
 
 fn validate_paint(errors: &mut Vec<String>, context: &DataContext, label: &str, paint: &Paint) {
-    if parse_color(&format_template(&paint.color, context)).is_none() {
+    if parse_color(&paint.color).is_none() {
         errors.push(format!(
             "{label}: '{}' is not #RRGGBB or #AARRGGBB",
             paint.color
@@ -2244,7 +2834,7 @@ pub fn validate_template(template: &str, context: &DataContext) -> Vec<String> {
             break;
         };
         let token = &remaining[..end];
-        let (expression, format) = token.rsplit_once(':').unwrap_or((token, "0.##"));
+        let (expression, format) = split_template_token(token);
         let expression = expression.trim();
         let format = format.trim();
         if context.get_string(expression).is_some()
@@ -2256,7 +2846,7 @@ pub fn validate_template(template: &str, context: &DataContext) -> Vec<String> {
             remaining = &remaining[end + 1..];
             continue;
         }
-        if let Err(error) = evaluate(expression, context) {
+        if let Err(error) = evaluate_value(expression, context) {
             errors.push(error);
         }
         remaining = &remaining[end + 1..];
@@ -2279,6 +2869,8 @@ impl Default for Canvas {
 impl Default for Placement {
     fn default() -> Self {
         Self {
+            host_dimensions: None,
+            clamp_taskbar_drag: false,
             reference: ReferenceTarget::default(),
             nest: SurfaceNest::Taskbar,
             horizontal: HorizontalAnchor::Left,
@@ -2305,7 +2897,7 @@ impl Paint {
         }
     }
     pub fn resolve(&self, context: &DataContext) -> Rgba {
-        let mut rgba = parse_color(&format_template(&self.color, context)).unwrap_or(Rgba {
+        let mut rgba = parse_color(&self.color).unwrap_or(Rgba {
             r: 255,
             g: 0,
             b: 255,
@@ -2327,12 +2919,14 @@ pub use theme_rendering::*;
 
 mod theme_expression;
 pub use theme_expression::*;
-mod account_classic;
-pub use account_classic::account_classic;
+
+mod theme_datetime;
+mod theme_limits;
+use theme_datetime::*;
 fn schema_version() -> u32 {
     THEME_SCHEMA_VERSION
 }
-fn default_render() -> Expression {
+pub(crate) fn default_render() -> Expression {
     1.0.into()
 }
 fn default_visibility() -> Expression {

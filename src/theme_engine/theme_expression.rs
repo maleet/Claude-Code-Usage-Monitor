@@ -1,6 +1,28 @@
 use super::*;
 
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum ExpressionValue {
+    Number(f64),
+    Text(String),
+}
+
+impl ExpressionValue {
+    fn number(&self) -> Result<f64, String> {
+        match self {
+            Self::Number(value) => Ok(*value),
+            Self::Text(_) => Err("Expected a number, found text".into()),
+        }
+    }
+}
+
 pub fn evaluate(source: &str, context: &DataContext) -> Result<f64, String> {
+    evaluate_value(source, context)?.number()
+}
+
+pub(super) fn evaluate_value(
+    source: &str,
+    context: &DataContext,
+) -> Result<ExpressionValue, String> {
     let mut parser = Parser {
         source: source.as_bytes(),
         index: 0,
@@ -18,6 +40,30 @@ pub fn evaluate(source: &str, context: &DataContext) -> Result<f64, String> {
     }
 }
 
+pub(super) fn split_template_token(token: &str) -> (&str, &str) {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut separator = None;
+    for (index, character) in token.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote.is_some() && character == '\\' {
+            escaped = true;
+        } else if quote == Some(character) {
+            quote = None;
+        } else if quote.is_none() && matches!(character, '"' | '\'') {
+            quote = Some(character);
+        } else if quote.is_none() && character == ':' {
+            separator = Some(index);
+        }
+    }
+    separator.map_or((token, "0.##"), |index| {
+        (&token[..index], &token[index + 1..])
+    })
+}
+
 pub(super) struct Parser<'a> {
     source: &'a [u8],
     index: usize,
@@ -25,26 +71,30 @@ pub(super) struct Parser<'a> {
 }
 
 impl Parser<'_> {
-    fn parse_expression(&mut self) -> Result<f64, String> {
+    fn parse_expression(&mut self) -> Result<ExpressionValue, String> {
         self.parse_or()
     }
-    fn parse_or(&mut self) -> Result<f64, String> {
+    fn parse_or(&mut self) -> Result<ExpressionValue, String> {
         let mut value = self.parse_and()?;
         while self.consume(b"||") {
             let rhs = self.parse_and()?;
-            value = ((value != 0.0) || (rhs != 0.0)) as u8 as f64;
+            value = ExpressionValue::Number(
+                ((value.number()? != 0.0) || (rhs.number()? != 0.0)) as u8 as f64,
+            );
         }
         Ok(value)
     }
-    fn parse_and(&mut self) -> Result<f64, String> {
+    fn parse_and(&mut self) -> Result<ExpressionValue, String> {
         let mut value = self.parse_comparison()?;
         while self.consume(b"&&") {
             let rhs = self.parse_comparison()?;
-            value = ((value != 0.0) && (rhs != 0.0)) as u8 as f64;
+            value = ExpressionValue::Number(
+                ((value.number()? != 0.0) && (rhs.number()? != 0.0)) as u8 as f64,
+            );
         }
         Ok(value)
     }
-    fn parse_comparison(&mut self) -> Result<f64, String> {
+    fn parse_comparison(&mut self) -> Result<ExpressionValue, String> {
         let mut value = self.parse_sum()?;
         loop {
             let operation = [
@@ -61,64 +111,80 @@ impl Parser<'_> {
                 return Ok(value);
             };
             let rhs = self.parse_sum()?;
-            value = match operation {
-                b">=" => value >= rhs,
-                b"<=" => value <= rhs,
-                b"==" => (value - rhs).abs() < f64::EPSILON,
-                b"!=" => (value - rhs).abs() >= f64::EPSILON,
-                b">" => value > rhs,
-                b"<" => value < rhs,
+            let comparison = match operation {
+                b"==" => match (&value, &rhs) {
+                    (ExpressionValue::Number(lhs), ExpressionValue::Number(rhs)) => {
+                        (lhs - rhs).abs() < f64::EPSILON
+                    }
+                    (ExpressionValue::Text(lhs), ExpressionValue::Text(rhs)) => lhs == rhs,
+                    _ => false,
+                },
+                b"!=" => match (&value, &rhs) {
+                    (ExpressionValue::Number(lhs), ExpressionValue::Number(rhs)) => {
+                        (lhs - rhs).abs() >= f64::EPSILON
+                    }
+                    (ExpressionValue::Text(lhs), ExpressionValue::Text(rhs)) => lhs != rhs,
+                    _ => true,
+                },
+                b">=" => value.number()? >= rhs.number()?,
+                b"<=" => value.number()? <= rhs.number()?,
+                b">" => value.number()? > rhs.number()?,
+                b"<" => value.number()? < rhs.number()?,
                 _ => false,
-            } as u8 as f64;
+            };
+            value = ExpressionValue::Number(comparison as u8 as f64);
         }
     }
-    fn parse_sum(&mut self) -> Result<f64, String> {
+    fn parse_sum(&mut self) -> Result<ExpressionValue, String> {
         let mut value = self.parse_term()?;
         loop {
             self.skip_space();
             match self.peek() {
                 Some(b'+') => {
                     self.index += 1;
-                    value += self.parse_term()?;
+                    let rhs = self.parse_term()?;
+                    value = ExpressionValue::Number(value.number()? + rhs.number()?);
                 }
                 Some(b'-') => {
                     self.index += 1;
-                    value -= self.parse_term()?;
+                    let rhs = self.parse_term()?;
+                    value = ExpressionValue::Number(value.number()? - rhs.number()?);
                 }
                 _ => return Ok(value),
             }
         }
     }
-    fn parse_term(&mut self) -> Result<f64, String> {
+    fn parse_term(&mut self) -> Result<ExpressionValue, String> {
         let mut value = self.parse_unary()?;
         loop {
             self.skip_space();
             match self.peek() {
                 Some(b'*') => {
                     self.index += 1;
-                    value *= self.parse_unary()?;
+                    let rhs = self.parse_unary()?;
+                    value = ExpressionValue::Number(value.number()? * rhs.number()?);
                 }
                 Some(b'/') => {
                     self.index += 1;
-                    let rhs = self.parse_unary()?;
+                    let rhs = self.parse_unary()?.number()?;
                     if rhs == 0.0 {
                         return Err("Division by zero".into());
                     }
-                    value /= rhs;
+                    value = ExpressionValue::Number(value.number()? / rhs);
                 }
                 Some(b'%') => {
                     self.index += 1;
-                    let rhs = self.parse_unary()?;
+                    let rhs = self.parse_unary()?.number()?;
                     if rhs == 0.0 {
                         return Err("Division by zero".into());
                     }
-                    value %= rhs;
+                    value = ExpressionValue::Number(value.number()? % rhs);
                 }
                 _ => return Ok(value),
             }
         }
     }
-    fn parse_unary(&mut self) -> Result<f64, String> {
+    fn parse_unary(&mut self) -> Result<ExpressionValue, String> {
         self.skip_space();
         match self.peek() {
             Some(b'+') => {
@@ -127,16 +193,18 @@ impl Parser<'_> {
             }
             Some(b'-') => {
                 self.index += 1;
-                Ok(-self.parse_unary()?)
+                Ok(ExpressionValue::Number(-self.parse_unary()?.number()?))
             }
             Some(b'!') => {
                 self.index += 1;
-                Ok((self.parse_unary()? == 0.0) as u8 as f64)
+                Ok(ExpressionValue::Number(
+                    (self.parse_unary()?.number()? == 0.0) as u8 as f64,
+                ))
             }
             _ => self.parse_primary(),
         }
     }
-    fn parse_primary(&mut self) -> Result<f64, String> {
+    fn parse_primary(&mut self) -> Result<ExpressionValue, String> {
         self.skip_space();
         if self.peek() == Some(b'(') {
             self.index += 1;
@@ -148,13 +216,19 @@ impl Parser<'_> {
             self.index += 1;
             return Ok(value);
         }
+        if matches!(self.peek(), Some(b'"' | b'\'')) {
+            return self.parse_string().map(ExpressionValue::Text);
+        }
         if self.peek().is_some_and(|c| c.is_ascii_digit() || c == b'.') {
-            return self.parse_number();
+            return self.parse_number().map(ExpressionValue::Number);
         }
         let identifier = self.parse_identifier()?;
         self.skip_space();
         if self.peek() == Some(b'(') {
             self.index += 1;
+            if identifier.eq_ignore_ascii_case("get") {
+                return self.parse_get();
+            }
             let mut arguments = Vec::new();
             self.skip_space();
             if self.peek() != Some(b')') {
@@ -174,9 +248,58 @@ impl Parser<'_> {
             self.index += 1;
             return call_function(&identifier, &arguments);
         }
-        self.context
-            .get(&identifier)
-            .ok_or_else(|| format!("Unknown value '{identifier}'"))
+        if let Some(value) = self.context.get(&identifier) {
+            Ok(ExpressionValue::Number(value))
+        } else if let Some(value) = self.context.get_string(&identifier) {
+            Ok(ExpressionValue::Text(value.to_string()))
+        } else {
+            Err(format!("Unknown value '{identifier}'"))
+        }
+    }
+    fn parse_get(&mut self) -> Result<ExpressionValue, String> {
+        self.skip_space();
+        if self.peek() == Some(b')') {
+            return Err("get expects get(target, property) or get(target.property)".into());
+        }
+
+        let first = self.parse_get_name()?;
+        self.skip_space();
+        let mut key = if self.peek() == Some(b',') {
+            self.index += 1;
+            self.skip_space();
+            let property = self.parse_get_name()?;
+            format!("{first}.{property}")
+        } else {
+            first
+        };
+        self.skip_space();
+        if self.peek() != Some(b')') {
+            return Err("get expects get(target, property) or get(target.property)".into());
+        }
+        self.index += 1;
+
+        if key.eq_ignore_ascii_case("self") {
+            key = "this".into();
+        } else if key
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("self."))
+        {
+            key.replace_range(..4, "this");
+        }
+        if let Some(value) = self.context.get(&key) {
+            Ok(ExpressionValue::Number(value))
+        } else if let Some(value) = self.context.get_string(&key) {
+            Ok(ExpressionValue::Text(value.to_string()))
+        } else {
+            Err(format!("get could not find '{key}'"))
+        }
+    }
+    fn parse_get_name(&mut self) -> Result<String, String> {
+        if matches!(self.peek(), Some(b'"' | b'\'')) {
+            self.parse_string()
+        } else {
+            self.parse_identifier()
+        }
     }
     fn parse_number(&mut self) -> Result<f64, String> {
         let start = self.index;
@@ -196,6 +319,40 @@ impl Parser<'_> {
             .ok()
             .and_then(|v| v.parse().ok())
             .ok_or_else(|| "Invalid number".to_string())
+    }
+    fn parse_string(&mut self) -> Result<String, String> {
+        let quote = self.peek().expect("parse_string requires a quote");
+        self.index += 1;
+        let mut result = Vec::new();
+        while let Some(character) = self.peek() {
+            self.index += 1;
+            if character == quote {
+                return String::from_utf8(result).map_err(|_| "Invalid UTF-8 in text".into());
+            }
+            if character != b'\\' {
+                result.push(character);
+                continue;
+            }
+            let escaped = self
+                .peek()
+                .ok_or_else(|| "Missing closing quote in text".to_string())?;
+            self.index += 1;
+            result.push(match escaped {
+                b'n' => b'\n',
+                b'r' => b'\r',
+                b't' => b'\t',
+                b'\\' => b'\\',
+                b'"' => b'"',
+                b'\'' => b'\'',
+                _ => {
+                    return Err(format!(
+                        "Unsupported escape sequence '\\{}'",
+                        escaped as char
+                    ))
+                }
+            });
+        }
+        Err("Missing closing quote in text".into())
     }
     fn parse_identifier(&mut self) -> Result<String, String> {
         let start = self.index;
@@ -230,7 +387,10 @@ impl Parser<'_> {
     }
 }
 
-pub(super) fn call_function(name: &str, args: &[f64]) -> Result<f64, String> {
+pub(super) fn call_function(
+    name: &str,
+    args: &[ExpressionValue],
+) -> Result<ExpressionValue, String> {
     let arity = |count: usize| {
         if args.len() == count {
             Ok(())
@@ -241,50 +401,67 @@ pub(super) fn call_function(name: &str, args: &[f64]) -> Result<f64, String> {
     match name.to_ascii_lowercase().as_str() {
         "min" => {
             arity(2)?;
-            Ok(args[0].min(args[1]))
+            Ok(ExpressionValue::Number(
+                args[0].number()?.min(args[1].number()?),
+            ))
         }
         "max" => {
             arity(2)?;
-            Ok(args[0].max(args[1]))
+            Ok(ExpressionValue::Number(
+                args[0].number()?.max(args[1].number()?),
+            ))
         }
         "clamp" => {
             arity(3)?;
-            if args[1] > args[2] {
+            let value = args[0].number()?;
+            let minimum = args[1].number()?;
+            let maximum = args[2].number()?;
+            if minimum > maximum {
                 return Err("clamp minimum cannot exceed maximum".into());
             }
-            Ok(args[0].clamp(args[1], args[2]))
+            Ok(ExpressionValue::Number(value.clamp(minimum, maximum)))
         }
         "round" => {
             arity(1)?;
-            Ok(args[0].round())
+            Ok(ExpressionValue::Number(args[0].number()?.round()))
         }
         "floor" => {
             arity(1)?;
-            Ok(args[0].floor())
+            Ok(ExpressionValue::Number(args[0].number()?.floor()))
         }
         "ceil" => {
             arity(1)?;
-            Ok(args[0].ceil())
+            Ok(ExpressionValue::Number(args[0].number()?.ceil()))
         }
         "abs" => {
             arity(1)?;
-            Ok(args[0].abs())
+            Ok(ExpressionValue::Number(args[0].number()?.abs()))
         }
         "sqrt" => {
             arity(1)?;
-            Ok(args[0].sqrt())
+            Ok(ExpressionValue::Number(args[0].number()?.sqrt()))
         }
         "pow" => {
             arity(2)?;
-            Ok(args[0].powf(args[1]))
+            Ok(ExpressionValue::Number(
+                args[0].number()?.powf(args[1].number()?),
+            ))
         }
         "if" => {
             arity(3)?;
-            Ok(if args[0] != 0.0 { args[1] } else { args[2] })
+            Ok(if args[0].number()? != 0.0 {
+                args[1].clone()
+            } else {
+                args[2].clone()
+            })
         }
         "lerp" => {
             arity(3)?;
-            Ok(args[0] + (args[1] - args[0]) * args[2])
+            let start = args[0].number()?;
+            let end = args[1].number()?;
+            Ok(ExpressionValue::Number(
+                start + (end - start) * args[2].number()?,
+            ))
         }
         _ => Err(format!("Unknown function '{name}'")),
     }
@@ -311,37 +488,92 @@ pub fn parse_color(source: &str) -> Option<Rgba> {
 }
 
 pub(super) fn format_usage_line(base: &str, context: &DataContext) -> Option<String> {
-    let (provider, window) = base.rsplit_once('.')?;
-    let account = provider.starts_with("accounts.");
-    if (!account
+    // Existing summaries always show consumption. A `.display` suffix opts
+    // this individual token into the user's usage direction preference.
+    let (base, metric) = base
+        .strip_suffix(".display")
+        .map(|base| (base, "display"))
+        .unwrap_or((base, "percentage"));
+    let dynamic = DataContext::limit_field(&format!("{base}.available"))
+        .filter(|(_, field)| *field == "available")
+        .map(|(owner, _)| owner.to_string());
+    let (provider, window) = if let Some(owner) = dynamic.as_deref() {
+        (owner, &base[owner.len() + 1..])
+    } else {
+        base.rsplit_once('.')?
+    };
+    let named_account = provider
+        .strip_prefix("accounts.")
+        .and_then(|path| path.split_once('.'))
+        .is_some_and(|(provider, id)| {
+            matches!(provider, "claude" | "codex")
+                && !id.is_empty()
+                && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        });
+    if (!named_account
         && !matches!(
             provider,
-            "active" | "claude" | "codex" | "antigravity" | "opencode" | "cursor"
+            "active"
+                | "claude"
+                | "codex"
+                | "antigravity"
+                | "antigravity.gemini"
+                | "antigravity.external"
+                | "opencode"
+                | "cursor"
+                | "grok"
+                | "copilot"
         ))
-        || !matches!(window, "session" | "weekly")
+        || (dynamic.is_none()
+            && !matches!(
+                window,
+                "session" | "five_hour" | "weekly" | "monthly" | "credits"
+            ))
     {
         return None;
     }
-    if !account && context.get("data.loading").unwrap_or(0.0) != 0.0 {
+    let scoped_error = context.get(&format!("{provider}.has_error")).or_else(|| {
+        if provider.starts_with("antigravity.") {
+            context.get("antigravity.has_error")
+        } else {
+            None
+        }
+    });
+    if scoped_error.is_none() && context.get("data.loading").unwrap_or(0.0) != 0.0 {
         return Some("--".into());
     }
-    if account {
-        if context.get(&format!("{provider}.has_error")).unwrap_or(0.0) != 0.0 {
-            return Some("!".into());
-        }
-        if context.get(&format!("{provider}.available")).unwrap_or(0.0) == 0.0 {
-            return Some("--".into());
-        }
+    let available = context.get(&format!("{provider}.available")).unwrap_or(0.0) != 0.0;
+    // A pool Antigravity did not report, while Antigravity itself answered, is
+    // "no limit data", not an error.
+    if provider.starts_with("antigravity")
+        && context.get("antigravity.reported").unwrap_or(0.0) != 0.0
+        && (!available || context.get(&format!("{provider}.{window}.available")) == Some(0.0))
+    {
+        return Some("--".into());
     }
-    if !account
-        && (context.get("data.has_error").unwrap_or(0.0) != 0.0
-            || (context.get("data.poll_ok").unwrap_or(1.0) != 0.0
-                && context.get(&format!("{provider}.available")).unwrap_or(0.0) == 0.0))
+    if scoped_error == Some(0.0) && !available {
+        return Some("--".into());
+    }
+    if scoped_error
+        .map(|error| error != 0.0 && !available)
+        .unwrap_or_else(|| context.get("data.has_error").unwrap_or(0.0) != 0.0)
+        || (context.get("data.poll_ok").unwrap_or(1.0) != 0.0
+            && context.get(&format!("{provider}.available")).unwrap_or(0.0) == 0.0)
     {
         return Some("!".into());
     }
+    if dynamic.is_some() && context.get(&format!("{base}.available")) == Some(0.0) {
+        return Some("--".into());
+    }
+    // An Antigravity pool may report one window but not the other; an absent
+    // window is "no limit data", not 0% used.
+    if provider.starts_with("antigravity")
+        && context.get(&format!("{provider}.{window}.available")) == Some(0.0)
+    {
+        return Some("--".into());
+    }
     let percentage = context
-        .get(&format!("{provider}.{window}.percentage"))
+        .get(&format!("{provider}.{window}.{metric}"))
         .unwrap_or(0.0);
     let percentage = format_value(percentage, "0", context);
     if context
@@ -373,23 +605,59 @@ pub(super) fn localized<'a>(context: &'a DataContext, name: &str, fallback: &'a 
     context.get_string(name).unwrap_or(fallback)
 }
 
+fn format_half_step(val: f64, suffix: &str) -> String {
+    let rounded = (val * 2.0).round() / 2.0;
+    if rounded.fract().abs() < 1e-4 {
+        format!("{:.0}{suffix}", rounded)
+    } else {
+        format!("{:.1}{suffix}", rounded)
+    }
+}
+
+pub(super) fn format_duration_short(seconds: u64, context: &DataContext) -> String {
+    let day_suffix = localized(context, "i18n.day_suffix", "d");
+    let hour_suffix = localized(context, "i18n.hour_suffix", "h");
+    let minute_suffix = localized(context, "i18n.minute_suffix", "m");
+    let second_suffix = localized(context, "i18n.second_suffix", "s");
+
+    if seconds >= 86_400 {
+        if seconds >= 864_000 {
+            // Round the remainder so even saturated template values cannot overflow.
+            let days = seconds / 86_400 + u64::from(seconds % 86_400 >= 43_200);
+            format!("{days}{day_suffix}")
+        } else {
+            let days = seconds as f64 / 86_400.0;
+            format_half_step(days, day_suffix)
+        }
+    } else if seconds >= 3_600 {
+        if seconds >= 36_000 {
+            let hours = (seconds + 1800) / 3600;
+            if hours >= 24 {
+                format!("1{day_suffix}")
+            } else {
+                format!("{hours}{hour_suffix}")
+            }
+        } else {
+            let hours = seconds as f64 / 3600.0;
+            format_half_step(hours, hour_suffix)
+        }
+    } else if seconds >= 60 {
+        let minutes = ((seconds + 30) / 60).min(59);
+        format!("{minutes}{minute_suffix}")
+    } else if seconds > 0 {
+        format!("{seconds}{second_suffix}")
+    } else {
+        localized(context, "i18n.now", "now").to_string()
+    }
+}
+
 pub(super) fn format_value(value: f64, format: &str, context: &DataContext) -> String {
+    if let Some(value) = format_timestamp(value, format, context) {
+        return value;
+    }
     if format.eq_ignore_ascii_case("duration_short") {
         let seconds = value.max(0.0).round() as u64;
-        let days = seconds / 86_400;
-        let hours = seconds / 3_600;
-        let minutes = seconds / 60;
-        return if days > 0 {
-            format!("{days}{}", localized(context, "i18n.day_suffix", "d"))
-        } else if hours > 0 {
-            format!("{hours}{}", localized(context, "i18n.hour_suffix", "h"))
-        } else if minutes > 0 {
-            format!("{minutes}{}", localized(context, "i18n.minute_suffix", "m"))
-        } else if seconds > 0 {
-            format!("{seconds}{}", localized(context, "i18n.second_suffix", "s"))
-        } else {
-            localized(context, "i18n.now", "now").to_string()
-        };
+        return format_duration_short(seconds, context);
     }
     if format.eq_ignore_ascii_case("duration") {
         let seconds = value.max(0.0).round() as u64;

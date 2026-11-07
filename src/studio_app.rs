@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use lucide_icons::Icon as LucideIcon;
@@ -32,8 +34,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::app_settings::{
-    self, SettingsFile, POLL_15_MIN, POLL_15_MIN_SECONDS, POLL_1_HOUR, POLL_1_HOUR_SECONDS,
-    POLL_1_MIN, POLL_1_MIN_SECONDS, POLL_5_MIN, POLL_5_MIN_SECONDS,
+    self, SettingsFile, UsageCache, POLL_15_MIN, POLL_15_MIN_SECONDS, POLL_1_HOUR,
+    POLL_1_HOUR_SECONDS, POLL_1_MIN, POLL_1_MIN_SECONDS, POLL_5_MIN, POLL_5_MIN_SECONDS,
 };
 use crate::context_menu::{
     self, ContextMenuAction, ContextMenuDocument, ContextMenuItem, ContextMenuItemKind,
@@ -52,15 +54,9 @@ use crate::theme_engine::{
     SurfaceNest, TextAlign, ThemeDocument, ThemeRuntime, VerticalAnchor,
 };
 use crate::theme_package;
-use crate::ui::components::action_helper::show_action_helper;
 use crate::ui::components::anchor_point::{AnchorPoint, AnchorPointPicker};
-use crate::ui::components::card::reference_card as expression_reference_card;
 use crate::ui::components::dropdown::{
     dropdown_selectable_label, dropdown_selectable_value, Dropdown,
-};
-use crate::ui::components::expression_helper::{
-    show_expression_helper, ExpressionHelperAction,
-    ExpressionHelperState as ExpressionHelperEditorState,
 };
 use crate::ui::components::helper_field::helper_preview_field;
 use crate::ui::components::icon::{
@@ -69,7 +65,8 @@ use crate::ui::components::icon::{
 };
 use crate::ui::components::layout::{
     available_control_width as inspector_control_width, inspector_row as labeled, setting_row,
-    setting_separator, settings_scroll_area, settings_section as section, studio_region,
+    setting_row_with_mark, setting_separator, settings_scroll_area, settings_section as section,
+    studio_region,
 };
 use crate::ui::components::number_field::NumberField;
 use crate::ui::components::searchable_dropdown::searchable_dropdown;
@@ -79,18 +76,14 @@ use crate::ui::components::text_field::{
     name_editor as inspector_name_editor,
     name_editor_with_prefix as inspector_prefixed_name_editor, singleline as singleline_text_edit,
 };
-use crate::ui::components::text_helper::{
-    show_text_helper, TextHelperAction, TextHelperState as TextHelperEditorState,
-    TextTemplateFormat, TextTemplateValueKind,
-};
 use crate::ui::components::toggle::Toggle;
 use crate::ui::components::tree_row::{
     paint_background as paint_scene_row_background, selected_style as scene_row_style,
 };
-use crate::ui::theme::{accent, configure_style, menu_surface, muted};
+use crate::ui::theme::{accent, configure_style, menu_surface, muted, provider_mark_glyph};
 use crate::ui::tokens::{
-    CONTROL_HEIGHT, DEFAULT_DASHBOARD_HEIGHT, DEFAULT_DASHBOARD_WIDTH, DEFAULT_INSPECTOR_WIDTH,
-    DEFAULT_MENU_WIDTH, DEFAULT_SCENE_WIDTH, MAX_CANVAS_ZOOM, MIN_CANVAS_ZOOM,
+    CANVAS_ZOOM_LEVELS, CONTROL_HEIGHT, DEFAULT_DASHBOARD_HEIGHT, DEFAULT_DASHBOARD_WIDTH,
+    DEFAULT_INSPECTOR_WIDTH, DEFAULT_MENU_WIDTH, DEFAULT_SCENE_WIDTH,
 };
 
 const DEFAULT_LIVE_APPLY: bool = false;
@@ -113,8 +106,8 @@ pub fn handle_cli_mode(args: &[String]) -> bool {
         .and_then(|value| value.parse::<isize>().ok())
         .unwrap_or(0);
     let owner_hwnd = HWND(owner as *mut _);
-    let _dashboard_instance = match crate::dashboard::claim_instance() {
-        Ok(Some(instance)) => instance,
+    let mut dashboard_instance = match crate::dashboard::claim_instance() {
+        Ok(Some(instance)) => Some(instance),
         Ok(None) => return true,
         Err(error) => {
             crate::dashboard::report_launch_failure(owner_hwnd, &error);
@@ -133,33 +126,134 @@ pub fn handle_cli_mode(args: &[String]) -> bool {
         .unwrap_or(DEFAULT_DASHBOARD_HEIGHT);
     let dashboard_icon = eframe::icon_data::from_png_bytes(include_bytes!("icons/16x16.png"))
         .expect("src/icons/16x16.png must be a valid PNG app icon");
+    let result = if args.iter().any(|arg| arg == "--dashboard-warp") {
+        warp::run(
+            dashboard_width,
+            dashboard_height,
+            dashboard_icon,
+            owner,
+            initial_page,
+        )
+        .map_err(|error| match std::env::var("CCUM_DASHBOARD_OPENGL_ERROR") {
+            Ok(gl_error) => format!("OpenGL: {gl_error}; WARP: {error}"),
+            Err(_) => format!("WARP: {error}"),
+        })
+    } else {
+        run_dashboard_with_fallback(|renderer, gl_error| match renderer {
+            DashboardRenderer::OpenGl => run_dashboard(
+                dashboard_width,
+                dashboard_height,
+                dashboard_icon.clone(),
+                owner,
+                initial_page,
+            ),
+            DashboardRenderer::Warp => {
+                // winit cannot create another event loop after eframe has created one.
+                // Release our process slot before starting a fresh WARP dashboard. The
+                // child claims the same guard, so concurrent launch requests still coalesce.
+                if let Some(handle) = dashboard_instance.take() {
+                    unsafe {
+                        let _ = windows::Win32::Foundation::CloseHandle(handle);
+                    }
+                }
+                launch_warp_dashboard(args, gl_error.unwrap_or_default())
+                    .map_err(|error| eframe::Error::AppCreation(error.into()))
+            }
+        })
+    };
+    if let Some(handle) = dashboard_instance.take() {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
+        }
+    }
+    let failure = match result {
+        Ok(()) => return true,
+        Err(failure) => failure,
+    };
+    let settings = app_settings::load_settings();
+    let language = localization::resolve_language(
+        settings.language.as_deref().and_then(LanguageId::from_code),
+    );
+    crate::dashboard::report_launch_failure(
+        owner_hwnd,
+        &format!(
+            "{}: {}",
+            language.text("The dashboard could not initialize"),
+            failure
+        ),
+    );
+    true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DashboardRenderer {
+    OpenGl,
+    Warp,
+}
+
+fn launch_warp_dashboard(args: &[String], gl_error: &str) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut command = std::process::Command::new(executable);
+    command.args(args.iter().skip(1)).arg("--dashboard-warp");
+    command.env("CCUM_DASHBOARD_OPENGL_ERROR", gl_error);
+    if crate::diagnose::is_enabled() {
+        command.arg("--diagnose-append");
+    }
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn run_dashboard_with_fallback(
+    mut run: impl FnMut(DashboardRenderer, Option<&str>) -> eframe::Result,
+) -> Result<(), String> {
+    let glow_error = match run(DashboardRenderer::OpenGl, None) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    crate::diagnose::log(format!(
+        "dashboard OpenGL initialization failed: {glow_error}"
+    ));
+
+    // Context/configuration failures can occur before the OpenGL painter exists.
+    if matches!(
+        &glow_error,
+        eframe::Error::OpenGL(_) | eframe::Error::Glutin(_) | eframe::Error::NoGlutinConfigs(..)
+    ) {
+        match run(DashboardRenderer::Warp, Some(&glow_error.to_string())) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                crate::diagnose::log(format!("dashboard WARP initialization failed: {error}"));
+                Err(format!("OpenGL: {glow_error}; WARP: {error}"))
+            }
+        }
+    } else {
+        Err(format!("OpenGL: {glow_error}"))
+    }
+}
+
+fn run_dashboard(
+    width: f32,
+    height: f32,
+    icon: egui::IconData,
+    owner: isize,
+    initial_page: Page,
+) -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Usage Monitor")
-            .with_inner_size([dashboard_width, dashboard_height])
-            .with_icon(dashboard_icon),
+            .with_inner_size([width, height])
+            .with_icon(icon),
         renderer: eframe::Renderer::Glow,
         centered: true,
         ..Default::default()
     };
-    if let Err(error) = eframe::run_native(
+    eframe::run_native(
         "ClaudeCodeUsageMonitor.Studio",
         options,
         Box::new(move |context| Ok(Box::new(StudioApp::new(context, owner, initial_page)))),
-    ) {
-        let settings = app_settings::load_settings();
-        let language = localization::resolve_language(
-            settings.language.as_deref().and_then(LanguageId::from_code),
-        );
-        crate::dashboard::report_launch_failure(
-            owner_hwnd,
-            &format!(
-                "{}: {error}",
-                language.text("The dashboard could not initialize")
-            ),
-        );
-    }
-    true
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -168,85 +262,7 @@ enum Page {
     Studio,
     ContextMenus,
     Assets,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ContextMenuActionKind {
-    OpenDashboard,
-    Refresh,
-    SetUpdateFrequency,
-    ToggleProvider,
-    ToggleStartup,
-    ToggleWidget,
-    SetLanguage,
-    CheckForUpdates,
-    ToggleLayerRender,
-    LayerActions,
-    OpenUrl,
-    Exit,
-}
-
-impl ContextMenuActionKind {
-    const ALL: [Self; 12] = [
-        Self::OpenDashboard,
-        Self::Refresh,
-        Self::SetUpdateFrequency,
-        Self::ToggleProvider,
-        Self::ToggleStartup,
-        Self::ToggleWidget,
-        Self::SetLanguage,
-        Self::CheckForUpdates,
-        Self::ToggleLayerRender,
-        Self::LayerActions,
-        Self::OpenUrl,
-        Self::Exit,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::OpenDashboard => "Open Dashboard",
-            Self::Refresh => "Refresh",
-            Self::SetUpdateFrequency => "Set update frequency",
-            Self::ToggleProvider => "Toggle provider",
-            Self::ToggleStartup => "Toggle Start with Windows",
-            Self::ToggleWidget => "Show widget",
-            Self::SetLanguage => "Set language",
-            Self::CheckForUpdates => "Check for updates",
-            Self::ToggleLayerRender => "Toggle layer Render",
-            Self::LayerActions => "Run layer actions",
-            Self::OpenUrl => "Open URL",
-            Self::Exit => "Exit",
-        }
-    }
-
-    fn default_action(self) -> ContextMenuAction {
-        match self {
-            Self::OpenDashboard => ContextMenuAction::OpenDashboard,
-            Self::Refresh => ContextMenuAction::Refresh,
-            Self::SetUpdateFrequency => ContextMenuAction::SetUpdateFrequency {
-                seconds: POLL_15_MIN_SECONDS,
-            },
-            Self::ToggleProvider => ContextMenuAction::ToggleProvider {
-                provider: ContextMenuProvider::Claude,
-            },
-            Self::ToggleStartup => ContextMenuAction::ToggleStartup,
-            Self::ToggleWidget => ContextMenuAction::ToggleWidget,
-            Self::SetLanguage => ContextMenuAction::SetLanguage {
-                language: "system".into(),
-            },
-            Self::CheckForUpdates => ContextMenuAction::CheckForUpdates,
-            Self::ToggleLayerRender => ContextMenuAction::ToggleLayerRender {
-                target: "main".into(),
-            },
-            Self::LayerActions => ContextMenuAction::LayerActions {
-                actions: "toggle(self, render)".into(),
-            },
-            Self::OpenUrl => ContextMenuAction::OpenUrl {
-                url: "https://".into(),
-            },
-            Self::Exit => ContextMenuAction::Exit,
-        }
-    }
+    Diagnostics,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -327,93 +343,6 @@ impl MouseEventField {
     }
 }
 
-struct ExpressionHelperState {
-    selection: Selection,
-    field: ExpressionField,
-    editor: ExpressionHelperEditorState,
-}
-
-impl ExpressionHelperState {
-    fn new(selection: Selection, field: ExpressionField, draft: String) -> Self {
-        Self {
-            selection,
-            field,
-            editor: ExpressionHelperEditorState::new(draft),
-        }
-    }
-}
-
-struct ActionHelperState {
-    selection: Selection,
-    field: MouseEventField,
-    editor: ExpressionHelperEditorState,
-    target: String,
-    property: MouseActionProperty,
-    value: String,
-    context_menu_reference: String,
-}
-
-impl ActionHelperState {
-    fn new(selection: Selection, field: MouseEventField, draft: String) -> Self {
-        Self {
-            selection,
-            field,
-            editor: ExpressionHelperEditorState::new(draft),
-            target: "self".into(),
-            property: MouseActionProperty::Render,
-            value: "false".into(),
-            context_menu_reference: context_menu::CLASSIC_CONTEXT_MENU_ID.into(),
-        }
-    }
-}
-
-struct TextTemplateHelperState {
-    target: TextTemplateHelperTarget,
-    editor: TextHelperEditorState,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum TextTemplateHelperTarget {
-    Theme(Selection),
-    ContextMenu(Vec<usize>),
-}
-
-impl TextTemplateHelperState {
-    fn for_theme(selection: Selection, draft: String) -> Self {
-        Self {
-            target: TextTemplateHelperTarget::Theme(selection),
-            editor: TextHelperEditorState::new(draft),
-        }
-    }
-
-    fn for_context_menu(path: Vec<usize>, draft: String) -> Self {
-        Self {
-            target: TextTemplateHelperTarget::ContextMenu(path),
-            editor: TextHelperEditorState::new(draft),
-        }
-    }
-}
-
-struct ContextMenuActionHelperState {
-    path: Vec<usize>,
-    editor: ExpressionHelperEditorState,
-    target: String,
-    property: MouseActionProperty,
-    value: String,
-}
-
-impl ContextMenuActionHelperState {
-    fn new(path: Vec<usize>, action: &ContextMenuAction) -> Self {
-        Self {
-            path,
-            editor: ExpressionHelperEditorState::new(context_menu_action_script(action)),
-            target: "self".into(),
-            property: MouseActionProperty::Render,
-            value: "false".into(),
-        }
-    }
-}
-
 struct ThemeDeletionConfirmation {
     path: PathBuf,
     name: String,
@@ -422,6 +351,7 @@ struct ThemeDeletionConfirmation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PendingUnsavedAction {
     Close,
+    Update { install: bool },
     ActivateTheme(PathBuf),
     NewTheme,
 }
@@ -436,36 +366,242 @@ struct AssetDeletionConfirmation {
     asset: theme_engine::ManagedAsset,
 }
 
+const PREVIEW_RENDER_MAX_EDGE: f32 = 1600.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreviewRenderKey {
+    surface_index: usize,
+    width: u32,
+    height: u32,
+}
+
+struct PreviewRenderRequest {
+    generation: u64,
+    key: PreviewRenderKey,
+    theme: ThemeDocument,
+    usage: Option<AppUsageData>,
+    runtime: ThemeRuntime,
+    scale: f64,
+}
+
+struct PreviewRenderResult {
+    generation: u64,
+    key: PreviewRenderKey,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+#[derive(Default)]
+struct PreviewRenderMailbox {
+    pending: Option<PreviewRenderRequest>,
+    shutdown: bool,
+}
+
+impl PreviewRenderMailbox {
+    fn replace(&mut self, request: PreviewRenderRequest) {
+        self.pending = Some(request);
+    }
+}
+
+struct PreviewRenderer {
+    mailbox: Arc<(Mutex<PreviewRenderMailbox>, Condvar)>,
+    results: mpsc::Receiver<PreviewRenderResult>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl PreviewRenderer {
+    fn new(context: egui::Context) -> Self {
+        let mailbox = Arc::new((Mutex::new(PreviewRenderMailbox::default()), Condvar::new()));
+        let worker_mailbox = mailbox.clone();
+        let (result_sender, results) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("theme-preview-render".into())
+            .spawn(move || loop {
+                let request = {
+                    let (lock, ready) = &*worker_mailbox;
+                    let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+                    while state.pending.is_none() && !state.shutdown {
+                        state = ready.wait(state).unwrap_or_else(|error| error.into_inner());
+                    }
+                    if state.shutdown {
+                        return;
+                    }
+                    state.pending.take().expect("pending preview request")
+                };
+
+                let mut rendered = if (request.scale - 1.0).abs() < f64::EPSILON {
+                    theme_engine::render_theme_surface_with_runtime(
+                        &request.theme,
+                        request.key.surface_index,
+                        request.usage.as_ref(),
+                        request.runtime,
+                    )
+                } else {
+                    theme_engine::render_theme_surface_with_runtime_at_scale(
+                        &request.theme,
+                        request.key.surface_index,
+                        request.usage.as_ref(),
+                        request.runtime,
+                        request.scale,
+                    )
+                };
+                let _render_warnings = &rendered.warnings;
+                if !theme_engine::surface_should_render(
+                    &request.theme,
+                    request.key.surface_index,
+                    request.usage.as_ref(),
+                    request.runtime,
+                ) {
+                    rendered.pixels.fill(0);
+                }
+
+                let superseded = {
+                    let (lock, _) = &*worker_mailbox;
+                    let state = lock.lock().unwrap_or_else(|error| error.into_inner());
+                    state.shutdown
+                        || state
+                            .pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.generation != request.generation)
+                };
+                if superseded {
+                    continue;
+                }
+
+                let mut rgba = Vec::with_capacity(rendered.pixels.len() * 4);
+                for pixel in rendered.pixels {
+                    rgba.extend_from_slice(&[
+                        ((pixel >> 16) & 0xff) as u8,
+                        ((pixel >> 8) & 0xff) as u8,
+                        (pixel & 0xff) as u8,
+                        ((pixel >> 24) & 0xff) as u8,
+                    ]);
+                }
+                if result_sender
+                    .send(PreviewRenderResult {
+                        generation: request.generation,
+                        key: request.key,
+                        width: rendered.width,
+                        height: rendered.height,
+                        rgba,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                context.request_repaint();
+            })
+            .expect("unable to start theme preview renderer");
+        Self {
+            mailbox,
+            results,
+            worker: Some(worker),
+        }
+    }
+
+    fn request(&self, request: PreviewRenderRequest) {
+        let (lock, ready) = &*self.mailbox;
+        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        state.replace(request);
+        ready.notify_one();
+    }
+
+    fn take_latest(&self) -> Option<PreviewRenderResult> {
+        self.results.try_iter().last()
+    }
+}
+
+impl Drop for PreviewRenderer {
+    fn drop(&mut self) {
+        let (lock, ready) = &*self.mailbox;
+        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        state.shutdown = true;
+        state.pending = None;
+        ready.notify_one();
+        drop(state);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn preview_render_scale(
+    logical_width: u32,
+    logical_height: u32,
+    available: egui::Vec2,
+    pixels_per_point: f32,
+) -> (f64, u32, u32) {
+    let pixels_per_point = if pixels_per_point.is_finite() {
+        pixels_per_point.max(1.0)
+    } else {
+        1.0
+    };
+    let target_width = (available.x.max(1.0) * pixels_per_point).min(PREVIEW_RENDER_MAX_EDGE);
+    let target_height = (available.y.max(1.0) * pixels_per_point).min(PREVIEW_RENDER_MAX_EDGE);
+    let scale = (target_width as f64 / logical_width.max(1) as f64)
+        .min(target_height as f64 / logical_height.max(1) as f64)
+        .clamp(0.25, 1.0);
+    let width = (logical_width.max(1) as f64 * scale).round().max(1.0) as u32;
+    let height = (logical_height.max(1) as f64 * scale).round().max(1.0) as u32;
+    (scale, width, height)
+}
+
+fn preview_countdown_refresh_delay(data: Option<&AppUsageData>) -> Option<Duration> {
+    let now = std::time::SystemTime::now();
+    data?
+        .all_usage()
+        .flat_map(|usage| [&usage.session, &usage.weekly])
+        .filter_map(|section| section.resets_at?.duration_since(now).ok())
+        .map(preview_countdown_delay)
+        .min()
+}
+
+fn preview_countdown_delay(remaining: Duration) -> Duration {
+    let seconds = remaining.as_secs();
+    if seconds >= 60 {
+        Duration::from_secs(seconds % 60 + 1)
+    } else {
+        Duration::from_secs(1)
+    }
+}
+
 struct StudioApp {
     owner: isize,
+    update_status: crate::dashboard::UpdateStatus,
+    diagnostics: studio_diagnostics::DiagnosticsView,
     page: Page,
     settings: SettingsFile,
-    account_login: Option<crate::codex_oauth::LoginTask>,
-    account_job: Option<std::sync::mpsc::Receiver<Result<studio_accounts::AccountChange, String>>>,
-    account_error: Option<String>,
-    account_delete: Option<String>,
+    synced_poll_interval_ms: u32,
+    synced_taskbar_lock: bool,
+    poll_interval_editor_generation: u64,
     startup_enabled: bool,
     theme: ThemeDocument,
     theme_path: Option<PathBuf>,
+    available_themes: AvailableThemesCache,
     selection: Selection,
     preview: Option<egui::TextureHandle>,
     preview_dirty: bool,
+    preview_renderer: PreviewRenderer,
+    preview_generation: u64,
+    preview_render_key: Option<PreviewRenderKey>,
     usage: Option<AppUsageData>,
     usage_poll_ok: bool,
     usage_has_error: bool,
     last_cache_read: Instant,
+    next_preview_countdown_refresh: Option<Instant>,
+    next_preview_clock_refresh: Option<Instant>,
     dirty: bool,
     live_apply: bool,
     zoom: f32,
+    preview_pan: egui::Vec2,
     undo_stack: Vec<ThemeDocument>,
     redo_stack: Vec<ThemeDocument>,
     history_snapshot: ThemeDocument,
     scene_width: f32,
     inspector_width: f32,
     hovered_scene_item: Option<Selection>,
-    expression_helper: Option<ExpressionHelperState>,
-    action_helper: Option<ActionHelperState>,
-    text_template_helper: Option<TextTemplateHelperState>,
+    helper: Option<HelperSession>,
     preview_mouse_overrides: HashMap<MouseActionOverrideKey, Expression>,
     preview_hover_target: Option<(usize, String)>,
     preview_pending_click: Option<(Instant, usize, String)>,
@@ -485,16 +621,16 @@ struct StudioApp {
     context_menu_path: Option<PathBuf>,
     context_menu_dirty: bool,
     context_menu_selection: Option<Vec<usize>>,
-    context_menu_action_helper: Option<ContextMenuActionHelperState>,
     delete_context_menu_confirmation: Option<(PathBuf, String)>,
 }
 
-mod studio_accounts;
 mod studio_assets;
 mod studio_context_menus;
 mod studio_core;
+mod studio_diagnostics;
 mod studio_settings;
 mod studio_theme_workspace;
+mod warp;
 
 fn scene_subtree_ids(objects: &[SceneObject], root_id: &str) -> std::collections::HashSet<String> {
     let mut ids = std::collections::HashSet::from([root_id.to_string()]);
@@ -598,6 +734,15 @@ fn reserved_scene_ids(surface: &SceneObject) -> std::collections::HashSet<String
 
 impl eframe::App for StudioApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_window_size();
+    }
+}
+
+impl StudioApp {
+    fn draw(&mut self, ui: &mut egui::Ui) {
         self.handle_dropped_files(ui.ctx());
         if let Some(size) = ui
             .ctx()
@@ -607,10 +752,6 @@ impl eframe::App for StudioApp {
             self.settings.dashboard_height = Some(size.y);
         }
         let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
-        if close_requested && self.account_job.is_some() {
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        }
         if close_requested && (self.dirty || self.pending_unsaved_action.is_some()) {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -641,7 +782,7 @@ impl eframe::App for StudioApp {
         ui.ctx().request_repaint_after(Duration::from_millis(500));
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn save_window_size(&self) {
         // Reload first so a monitor-process settings update made while the
         // dashboard was open is not overwritten by this final size save.
         let mut settings = app_settings::load_settings();
@@ -653,7 +794,7 @@ impl eframe::App for StudioApp {
     }
 }
 
-fn style_native_titlebar(context: &eframe::CreationContext<'_>) {
+fn style_native_titlebar(context: &impl HasWindowHandle) {
     let Ok(window_handle) = context.window_handle() else {
         return;
     };
@@ -672,16 +813,16 @@ fn style_native_titlebar(context: &eframe::CreationContext<'_>) {
             let _ = SendMessageW(
                 hwnd,
                 WM_SETICON,
-                WPARAM(ICON_BIG as usize),
-                LPARAM(large_icon.0 as isize),
+                Some(WPARAM(ICON_BIG as usize)),
+                Some(LPARAM(large_icon.0 as isize)),
             );
         }
         if !small_icon.is_invalid() {
             let _ = SendMessageW(
                 hwnd,
                 WM_SETICON,
-                WPARAM(ICON_SMALL as usize),
-                LPARAM(small_icon.0 as isize),
+                Some(WPARAM(ICON_SMALL as usize)),
+                Some(LPARAM(small_icon.0 as isize)),
             );
         }
         for (attribute, color) in [
@@ -832,6 +973,8 @@ mod studio_scene_helpers;
 use studio_scene_helpers::*;
 mod studio_helper_panels;
 use studio_helper_panels::*;
+mod studio_helper;
+use studio_helper::*;
 mod studio_context_menu_editor;
 use studio_context_menu_editor::*;
 mod studio_inspectors;

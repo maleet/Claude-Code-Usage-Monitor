@@ -1,5 +1,23 @@
 use super::*;
 
+/// The automatic floating card owns its inset; it is not part of theme layout.
+pub fn surface_horizontal_padding(
+    theme: &ThemeDocument,
+    surface_index: usize,
+    runtime: ThemeRuntime,
+) -> u32 {
+    if runtime.surface_nest == SurfaceNest::Floating
+        && theme
+            .surfaces
+            .get(surface_index)
+            .is_some_and(|surface| matches!(surface.background, LayerBackground::None))
+    {
+        10
+    } else {
+        0
+    }
+}
+
 pub fn format_template(template: &str, context: &DataContext) -> String {
     let mut output = String::new();
     let chars: Vec<char> = template.chars().collect();
@@ -22,7 +40,7 @@ pub fn format_template(template: &str, context: &DataContext) -> String {
         };
         let end = index + 1 + relative_end;
         let token: String = chars[index + 1..end].iter().collect();
-        let (expression, format) = token.rsplit_once(':').unwrap_or((&token, "0.##"));
+        let (expression, format) = split_template_token(&token);
         let expression = expression.trim();
         let format = format.trim();
         if let Some(value) = context.get_string(expression) {
@@ -33,8 +51,11 @@ pub fn format_template(template: &str, context: &DataContext) -> String {
             output
                 .push_str(&format_usage_badge(expression, context).unwrap_or_else(|| "--".into()));
         } else {
-            match evaluate(expression, context) {
-                Ok(value) => output.push_str(&format_value(value, format, context)),
+            match evaluate_value(expression, context) {
+                Ok(ExpressionValue::Number(value)) => {
+                    output.push_str(&format_value(value, format, context));
+                }
+                Ok(ExpressionValue::Text(value)) => output.push_str(&value),
                 Err(_) => output.push_str("--"),
             }
         }
@@ -80,7 +101,11 @@ pub fn render_theme_surface_with_runtime_at_scale(
     let mut warnings = Vec::new();
     let (logical_width, logical_height) =
         resolve_object_size(surface, data, runtime, &mut warnings);
-    let width = scaled_render_dimension(logical_width, scale);
+    let padding = surface_horizontal_padding(theme, surface_index, runtime);
+    // Snap the translation once, including parent clips, so fractional DPI
+    // cannot trim a content pixel at the far edge of the inset.
+    let content_offset = (padding as f64 * scale).round() / scale;
+    let width = scaled_render_dimension(logical_width + 2 * padding, scale);
     let height = scaled_render_dimension(logical_height, scale);
     let resolved_canvas = Canvas {
         width: logical_width,
@@ -91,6 +116,54 @@ pub fn render_theme_surface_with_runtime_at_scale(
     };
     let context = DataContext::from_usage_with_runtime(data, &resolved_canvas, runtime);
     let mut pixels = vec![0u32; width as usize * height as usize];
+    if runtime.surface_nest == SurfaceNest::Floating
+        && matches!(surface.background, LayerBackground::None)
+    {
+        let alpha = ((runtime.floating_card_opacity.min(100) as u32 * 255) / 100) as u8;
+        // Match the card to the system theme: a fixed dark card under
+        // light-mode content destroys contrast when the widget floats.
+        let dark = crate::theme::is_dark_mode();
+        let card_color = if dark {
+            Rgba {
+                r: 24,
+                g: 24,
+                b: 32,
+                a: alpha,
+            }
+        } else {
+            Rgba {
+                r: 243,
+                g: 243,
+                b: 243,
+                a: alpha,
+            }
+        };
+        let radius = 8.0 * scale;
+        fill_rounded(&mut pixels, width, height, card_color, radius);
+        let border_color = if dark {
+            Rgba {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 35,
+            }
+        } else {
+            Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 40,
+            }
+        };
+        stroke_rounded_rectangle(
+            &mut pixels,
+            width,
+            height,
+            border_color,
+            radius,
+            (1.0 * scale).max(1.0),
+        );
+    }
     let root_layer = ResolvedObject {
         source: surface,
         x: 0.0,
@@ -99,6 +172,7 @@ pub fn render_theme_surface_with_runtime_at_scale(
         height: logical_height as f64,
         parent_width: logical_width as f64,
         parent_height: logical_height as f64,
+        gap: evaluate(&surface.gap.0, &context).unwrap_or(0.0).max(0.0),
         opacity: 1.0,
         rotation: evaluate(&surface.rotation.0, &context).unwrap_or(0.0),
         clip: Vec::new(),
@@ -110,13 +184,17 @@ pub fn render_theme_surface_with_runtime_at_scale(
         &root_layer,
         &context,
         scale,
+        content_offset,
         &mut warnings,
     );
 
     let (resolved, layer_warnings) =
         resolve_objects_for(surface, &resolved_canvas, &surface.children, data, runtime);
     warnings.extend(layer_warnings);
-    for object in resolved {
+    for mut object in resolved {
+        for clip in &mut object.clip {
+            clip.x += content_offset;
+        }
         render_resolved_object(
             &mut pixels,
             width,
@@ -124,6 +202,7 @@ pub fn render_theme_surface_with_runtime_at_scale(
             &object,
             &context,
             scale,
+            content_offset,
             &mut warnings,
         );
     }
@@ -182,6 +261,7 @@ pub(super) fn render_resolved_object(
     object: &ResolvedObject<'_>,
     context: &DataContext,
     scale: f64,
+    content_offset: f64,
     warnings: &mut Vec<String>,
 ) {
     let object_width = (object.width * scale).round().max(1.0) as u32;
@@ -225,7 +305,7 @@ pub(super) fn render_resolved_object(
         &local,
         object_width,
         object_height,
-        (object.x * scale).round(),
+        (object.x * scale).round() + (content_offset * scale).round(),
         (object.y * scale).round(),
         object.rotation,
         object.opacity,
@@ -267,6 +347,7 @@ pub(super) fn resolve_objects_for<'a>(
             height: geometry.height,
             parent_width: geometry.parent_width,
             parent_height: geometry.parent_height,
+            gap: geometry.gap,
             opacity: geometry.opacity,
             rotation: geometry.rotation,
             clip: geometry.clip,
@@ -291,6 +372,8 @@ pub fn hit_test_mouse_event(
         return None;
     }
     let (width, height) = resolve_object_size(surface, data, runtime, &mut Vec::new());
+    let padding = surface_horizontal_padding(theme, surface_index, runtime) as f64;
+    let x = x - padding;
     let canvas = Canvas {
         width,
         width_expression: Some(surface.width.clone()),
@@ -339,9 +422,9 @@ pub fn hit_test_mouse_event(
         && point_in_clip(
             (x, y),
             ClipRegion {
-                x: 0.0,
+                x: -padding,
                 y: 0.0,
-                width: width as f64,
+                width: width as f64 + 2.0 * padding,
                 height: height as f64,
                 rotation: evaluate(
                     &surface.rotation.0,
@@ -391,10 +474,29 @@ pub fn resolve_object_bounds_with_runtime(
         &mut Vec::new(),
         &mut Vec::new(),
     )?;
-    Some((geometry.x, geometry.y, geometry.width, geometry.height))
+    Some((
+        geometry.x + surface_horizontal_padding(theme, surface_index, runtime) as f64,
+        geometry.y,
+        geometry.width,
+        geometry.height,
+    ))
 }
 
 pub fn resolve_surface_size(
+    theme: &ThemeDocument,
+    surface_index: usize,
+    data: Option<&AppUsageData>,
+    runtime: ThemeRuntime,
+) -> (u32, u32) {
+    let (width, height) = resolve_surface_content_size(theme, surface_index, data, runtime);
+    (
+        width + 2 * surface_horizontal_padding(theme, surface_index, runtime),
+        height,
+    )
+}
+
+/// Expression canvases always describe the authored content, without card chrome.
+pub fn resolve_surface_content_size(
     theme: &ThemeDocument,
     surface_index: usize,
     data: Option<&AppUsageData>,
@@ -414,7 +516,22 @@ pub(super) fn resolve_object_size(
     warnings: &mut Vec<String>,
 ) -> (u32, u32) {
     let fallback = Canvas::default();
-    let context = DataContext::from_usage_with_runtime(data, &fallback, runtime);
+    let mut context = DataContext::from_usage_with_runtime(data, &fallback, runtime);
+    let gap = match evaluate(&object.gap.0, &context) {
+        Ok(value) if value.is_finite() => value.max(0.0),
+        Ok(_) => {
+            warnings.push(format!(
+                "{}.gap did not produce a finite value",
+                object.name
+            ));
+            0.0
+        }
+        Err(error) => {
+            warnings.push(format!("{}.gap: {error}", object.name));
+            0.0
+        }
+    };
+    context.insert("this.gap", gap);
     let mut resolve = |label: &str, expression: &Expression, fallback: u32| match evaluate(
         &expression.0,
         &context,
@@ -456,7 +573,7 @@ pub fn resolve_surface_placement(
             offset_y: theme.placement.offset_y,
         };
     };
-    let (width, height) = resolve_surface_size(theme, surface_index, data, runtime);
+    let (width, height) = resolve_surface_content_size(theme, surface_index, data, runtime);
     let canvas = Canvas {
         width,
         width_expression: Some(surface.width.clone()),
@@ -494,7 +611,7 @@ pub fn surface_should_render(
     let Some(surface) = theme.surfaces.get(surface_index) else {
         return surface_index == 0;
     };
-    let (width, height) = resolve_surface_size(theme, surface_index, data, runtime);
+    let (width, height) = resolve_surface_content_size(theme, surface_index, data, runtime);
     let canvas = Canvas {
         width,
         width_expression: Some(surface.width.clone()),
@@ -514,6 +631,7 @@ pub(super) struct ObjectGeometry {
     height: f64,
     parent_width: f64,
     parent_height: f64,
+    gap: f64,
     opacity: f64,
     rotation: f64,
     clip: Vec<ClipRegion>,
@@ -573,6 +691,7 @@ pub(super) fn resolve_geometry(
                 height: canvas.height as f64,
                 parent_width: canvas.width as f64,
                 parent_height: canvas.height as f64,
+                gap: evaluate(&root.gap.0, context).unwrap_or(0.0).max(0.0),
                 opacity: 1.0,
                 rotation: evaluate(&root.rotation.0, context).unwrap_or(0.0),
                 clip: Vec::new(),
@@ -610,6 +729,7 @@ pub(super) fn resolve_geometry(
             height: canvas.height as f64,
             parent_width: canvas.width as f64,
             parent_height: canvas.height as f64,
+            gap: evaluate(&root.gap.0, context).unwrap_or(0.0).max(0.0),
             opacity: 1.0,
             rotation: evaluate(&root.rotation.0, context).unwrap_or(0.0),
             clip: Vec::new(),
@@ -620,6 +740,22 @@ pub(super) fn resolve_geometry(
     let mut object_context = context.clone();
     object_context.insert("parent.width", parent.width);
     object_context.insert("parent.height", parent.height);
+    object_context.insert("parent.gap", parent.gap);
+    let gap = match evaluate(&object.gap.0, &object_context) {
+        Ok(value) if value.is_finite() => value.max(0.0),
+        Ok(_) => {
+            warnings.push(format!(
+                "{}.gap did not produce a finite value",
+                object.name
+            ));
+            0.0
+        }
+        Err(error) => {
+            warnings.push(format!("{}.gap: {error}", object.name));
+            0.0
+        }
+    };
+    object_context.insert("this.gap", gap);
     let mut value = |name: &str, expression: &Expression, fallback: f64| match evaluate(
         &expression.0,
         &object_context,
@@ -644,13 +780,10 @@ pub(super) fn resolve_geometry(
     let parent_object = parent_index
         .map(|parent_index| &layers[parent_index])
         .unwrap_or(root);
-    let managed_layout = (parent_object.layout != ChildLayout::Freeform).then_some((
-        parent_object.layout,
-        parent_object.align,
-        &parent_object.gap,
-    ));
-    let (local_x, local_y) = if let Some((layout, align, gap)) = managed_layout {
-        let gap = value("parent.gap", gap, 0.0).max(0.0);
+    let managed_layout = (parent_object.layout != ChildLayout::Freeform)
+        .then_some((parent_object.layout, parent_object.align));
+    let (local_x, local_y) = if let Some((layout, align)) = managed_layout {
+        let gap = parent.gap;
         let mut cursor = 0.0;
         for sibling_index in 0..index {
             let same_parent = match parent_index {
@@ -747,6 +880,7 @@ pub(super) fn resolve_geometry(
         height,
         parent_width: parent.width,
         parent_height: parent.height,
+        gap,
         opacity: parent.opacity
             * (value("visibility", &object.visibility, 100.0).clamp(0.0, 100.0) / 100.0),
         rotation,
@@ -918,6 +1052,11 @@ pub(super) fn render_object_content(
             color,
         } => {
             let text = format_template(template, context);
+            let font_family = if context.force_segoe_ui {
+                crate::widget_font::segoe_ui_family(weight.gdi_weight())
+            } else {
+                font_family
+            };
             let size = (evaluate(&font_size.0, context).unwrap_or(13.0) * scale).max(1.0);
             let contrast = evaluate(&contrast.0, context)
                 .unwrap_or(1.4)
@@ -1062,7 +1201,7 @@ pub(super) fn render_text_mask(
         return;
     }
     unsafe {
-        let memory_dc = CreateCompatibleDC(HDC::default());
+        let memory_dc = CreateCompatibleDC(None);
         if memory_dc.is_invalid() {
             return;
         }
@@ -1079,13 +1218,20 @@ pub(super) fn render_text_mask(
             ..Default::default()
         };
         let mut bits = std::ptr::null_mut();
-        let bitmap = CreateDIBSection(memory_dc, &bitmap_info, DIB_RGB_COLORS, &mut bits, None, 0)
-            .unwrap_or_default();
+        let bitmap = CreateDIBSection(
+            Some(memory_dc),
+            &bitmap_info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            None,
+            0,
+        )
+        .unwrap_or_default();
         if bitmap.is_invalid() || bits.is_null() {
             let _ = DeleteDC(memory_dc);
             return;
         }
-        let old_bitmap = SelectObject(memory_dc, bitmap);
+        let old_bitmap = SelectObject(memory_dc, bitmap.into());
         std::ptr::write_bytes(bits, 0, width as usize * height as usize * 4);
         let font_name: Vec<u16> = font_family.encode_utf16().chain(Some(0)).collect();
         let font = CreateFontW(
@@ -1097,14 +1243,14 @@ pub(super) fn render_text_mask(
             0,
             0,
             0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            rendering.gdi_quality(),
+            DEFAULT_CHARSET,
+            OUT_TT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            windows::Win32::Graphics::Gdi::FONT_QUALITY(rendering.gdi_quality() as u8),
             (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
             PCWSTR::from_raw(font_name.as_ptr()),
         );
-        let old_font = SelectObject(memory_dc, font);
+        let old_font = SelectObject(memory_dc, font.into());
         let _ = SetBkMode(memory_dc, TRANSPARENT);
         let _ = SetTextColor(memory_dc, COLORREF(0x00FF_FFFF));
         let mut rect = RECT {
@@ -1133,9 +1279,9 @@ pub(super) fn render_text_mask(
             }
         }
         SelectObject(memory_dc, old_font);
-        let _ = DeleteObject(font);
+        let _ = DeleteObject(font.into());
         SelectObject(memory_dc, old_bitmap);
-        let _ = DeleteObject(bitmap);
+        let _ = DeleteObject(bitmap.into());
         let _ = DeleteDC(memory_dc);
     }
 }
@@ -1408,44 +1554,108 @@ pub(super) fn draw_progress(
     segments: u16,
     gap: f64,
 ) {
-    let mut fill = vec![0u32; pixels.len()];
-    fill_rounded(&mut fill, width, height, color, radius);
-    let count = segments as u32;
+    let horizontal = matches!(
+        direction,
+        ProgressDirection::LeftToRight | ProgressDirection::RightToLeft
+    );
+    let extent = if horizontal { width } else { height };
+    let layout = SegmentLayout::new(extent, segments as u32, gap);
+    // Segmented bars may end short of the box, so round the bar that is
+    // actually drawn, anchored at the direction's starting edge.
+    let used = layout.map_or(extent, |layout| layout.extent());
+    let start = match direction {
+        ProgressDirection::RightToLeft | ProgressDirection::BottomToTop => extent - used,
+        ProgressDirection::LeftToRight | ProgressDirection::TopToBottom => 0,
+    };
+    let (fill_width, fill_height) = if horizontal {
+        (used, height)
+    } else {
+        (width, used)
+    };
+    let mut fill = vec![0u32; fill_width as usize * fill_height as usize];
+    fill_rounded(&mut fill, fill_width, fill_height, color, radius);
     for y in 0..height {
         for x in 0..width {
-            let progress = match direction {
-                ProgressDirection::LeftToRight => (x + 1) as f64 / width as f64,
-                ProgressDirection::RightToLeft => (width - x) as f64 / width as f64,
-                ProgressDirection::TopToBottom => (y + 1) as f64 / height as f64,
-                ProgressDirection::BottomToTop => (height - y) as f64 / height as f64,
-            };
-            let mut visible = progress <= amount;
-            if visible && count > 1 {
-                let extent = if matches!(
-                    direction,
-                    ProgressDirection::LeftToRight | ProgressDirection::RightToLeft
-                ) {
-                    width
-                } else {
-                    height
-                };
-                let position = if matches!(
-                    direction,
-                    ProgressDirection::LeftToRight | ProgressDirection::RightToLeft
-                ) {
-                    x
-                } else {
-                    y
-                };
-                let segment_extent = extent as f64 / count as f64;
-                visible = (position as f64 % segment_extent) < (segment_extent - gap).max(1.0);
+            let position = if horizontal { x } else { y };
+            if position < start || position >= start + used {
+                continue;
             }
+            let local = position - start;
+            // Distance from the edge where the progress starts filling.
+            let along = match direction {
+                ProgressDirection::LeftToRight | ProgressDirection::TopToBottom => local,
+                ProgressDirection::RightToLeft | ProgressDirection::BottomToTop => used - 1 - local,
+            };
+            let progress = (along + 1) as f64 / used as f64;
+            let visible = progress <= amount && layout.is_none_or(|layout| layout.contains(along));
             if visible {
-                let index = (y * width + x) as usize;
-                blend(&mut pixels[index], fill[index], 1.0);
+                let fill_index = if horizontal {
+                    y * fill_width + local
+                } else {
+                    local * fill_width + x
+                };
+                blend(
+                    &mut pixels[(y * width + x) as usize],
+                    fill[fill_index as usize],
+                    1.0,
+                );
             }
         }
     }
+}
+
+/// Whole-pixel geometry for a segmented progress bar. Both the segment and
+/// the gap are snapped to physical pixels so every segment and every gap has
+/// the same width at fractional DPI scales. The gap is rounded and the
+/// segment floored, so the bar never exceeds its box and may end a few
+/// pixels short of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SegmentLayout {
+    pub(super) count: u32,
+    pub(super) segment: u32,
+    pub(super) gap: u32,
+}
+
+impl SegmentLayout {
+    pub(super) fn new(extent: u32, count: u32, gap: f64) -> Option<Self> {
+        if count <= 1 || extent <= 1 {
+            return None;
+        }
+        // Clamp pathological inputs so every segment keeps at least one
+        // physical pixel when the bar is wide enough.
+        let count = count.min(extent);
+        let gap = if gap.is_finite() {
+            gap.max(0.0).round().min(u32::MAX as f64) as u32
+        } else {
+            0
+        };
+        let gap = gap.min((extent - count) / (count - 1));
+        // Without visible gaps this is a continuous bar. Keep its full extent
+        // rather than discarding pixels to equalize indistinguishable segments.
+        if gap == 0 {
+            return None;
+        }
+        let segment = (extent - gap * (count - 1)) / count;
+        Some(Self {
+            count,
+            segment,
+            gap,
+        })
+    }
+
+    pub(super) fn extent(self) -> u32 {
+        self.segment * self.count + self.gap * (self.count - 1)
+    }
+
+    /// Whether the pixel `along` the bar from its starting edge is inside a segment.
+    pub(super) fn contains(self, along: u32) -> bool {
+        along < self.extent() && along % (self.segment + self.gap) < self.segment
+    }
+}
+
+#[cfg(test)]
+pub(super) fn segmented_position_visible(position: u32, extent: u32, count: u32, gap: f64) -> bool {
+    SegmentLayout::new(extent, count, gap).is_none_or(|layout| layout.contains(position))
 }
 
 pub(super) fn premultiply(color: Rgba) -> u32 {

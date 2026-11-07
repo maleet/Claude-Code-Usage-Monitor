@@ -11,7 +11,7 @@ impl<'a> Modal<'a> {
     pub(crate) fn new(title: &'a str, id: impl std::hash::Hash + std::fmt::Debug) -> Self {
         Self {
             title,
-            id: egui::Id::new(id),
+            id: egui::Id::unique(id),
             width: 360.0,
             fixed_height: None,
         }
@@ -67,8 +67,10 @@ mod tests {
                 .show(&context, |ui| {
                     ui.label("Content");
                 });
-            modal_rect = context.memory(|memory| memory.area_rect("fixed-modal-size-test"));
-            let _ = context.end_pass();
+            modal_rect = context
+                .memory(|memory| memory.area_rect(egui::Id::unique("fixed-modal-size-test")));
+            let mut output = context.end_pass();
+            output.textures_delta.clear();
         }
 
         let modal_rect = modal_rect.expect("modal should be visible");
