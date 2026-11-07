@@ -307,6 +307,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn embedded_manifest_declares_modern_windows_compatibility() {
+        use windows::Win32::System::LibraryLoader::{
+            FindResourceW, GetModuleHandleW, LoadResource, LockResource, SizeofResource,
+        };
+
+        unsafe {
+            let module = GetModuleHandleW(PCWSTR::null()).unwrap();
+            let resource = FindResourceW(
+                module,
+                PCWSTR(1usize as *const u16),
+                PCWSTR(24usize as *const u16),
+            );
+            assert!(
+                !resource.is_invalid(),
+                "The executable must embed its Windows manifest"
+            );
+            let length = SizeofResource(module, resource) as usize;
+            assert!(length > 0);
+            let loaded = LoadResource(module, resource).unwrap();
+            let bytes = LockResource(loaded).cast::<u8>();
+            assert!(!bytes.is_null());
+            let manifest = std::str::from_utf8(std::slice::from_raw_parts(bytes, length)).unwrap();
+            assert!(
+                manifest.contains("8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a"),
+                "Layered taskbar child windows require modern Windows compatibility"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_application_icons_can_be_loaded() {
+        let (large, small) = load_app_icons();
+        let has_large = !large.is_invalid();
+        let has_small = !small.is_invalid();
+        unsafe {
+            if has_large {
+                let _ = DestroyIcon(large);
+            }
+            if has_small {
+                let _ = DestroyIcon(small);
+            }
+        }
+        assert!(
+            has_large && has_small,
+            "The executable must retain both application icons"
+        );
+    }
+
+    #[test]
     fn tray_buttons_have_distinct_actions() {
         assert!(matches!(
             handle_message(LPARAM(WM_LBUTTONUP as isize)),

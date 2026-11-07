@@ -33,6 +33,15 @@ fn main() {
 
     res.compile().expect("Failed to compile Windows resources");
 
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+        // winres archives resource.o without referenced symbols. GNU-compatible
+        // linkers such as LLD can discard that archive, including the manifest
+        // required for layered taskbar child windows. Link the object directly.
+        let resource = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR was not set"))
+            .join("resource.o");
+        println!("cargo:rustc-link-arg={}", resource.display());
+    }
+
     println!("cargo:rerun-if-changed=src/app.manifest");
 }
 

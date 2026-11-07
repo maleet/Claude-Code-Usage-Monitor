@@ -68,7 +68,8 @@ the custom executable in its intended permanent location before doing this.
 
 ## Validation status
 
-All 169 Rust tests passed, including eight focused alert tests and a settings migration
+All 171 Rust tests passed, including eight focused alert tests, two compiled-resource
+regression tests and a settings migration
 regression test. Tests cover thresholds, startup above limits, persistence round trips,
 resets, stale windows, missing reset timestamps, invalid inputs, disabled alerts,
 independent usage windows and separate Codex accounts. Changed Rust files pass rustfmt.
@@ -80,9 +81,17 @@ lock file. No new project dependencies were added. The existing rendering test e
 manifest-local target directory for preview PNGs, even when CARGO_TARGET_DIR is redirected;
 creating that directory resolves its initial missing-directory failure.
 
-The final release EXE compiled successfully. Its imported DLLs are Windows system DLLs;
-no separate GCC/MinGW DLLs are required. The settings UI was visually inspected.
-The first native notification smoke test exposed that upstream --no-poll suppresses
-tray registration. The test button now resynchronises tray icons before sending, and
-all 169 tests passed again after this fix. Final native notification delivery still
-requires a manual smoke test; actual banner delivery has not been verified.
+The initial GNU/LLD release omitted the compiled Windows resources because the linker
+discarded winres's unreferenced static archive. Without the compatibility manifest,
+UpdateLayeredWindow failed with error 0x80070057 for the taskbar child window. GNU builds
+now link resource.o directly. Regression tests load the actual embedded manifest and
+application icons from the compiled test executable; both tests fail before the fix
+and pass afterwards. The release executable must also contain the seven icon, version,
+and manifest resources.
+
+The corrected release contains all seven resources. It was launched with the existing
+user configuration: polling succeeded and the former UpdateLayeredWindow error no longer
+appeared. The settings UI was visually inspected and Windows accepted a test notification.
+The test button resynchronises tray icons before sending, including in --no-poll mode.
+Explorer accepting a notification does not prove the banner was displayed; Windows
+notification settings still control banner visibility and sound.
