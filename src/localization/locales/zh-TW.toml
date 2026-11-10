@@ -473,3 +473,6 @@ copilot_window_title = "Copilot 使用量監控"
 "Windows controls notification banners and sound" = "Windows controls notification banners and sound"
 "Send test notification" = "Send test notification"
 "Alerts follow Update frequency. Use 1 minute for timely warnings." = "Alerts follow Update frequency. Use 1 minute for timely warnings."
+
+"Claude Fable" = "Claude Fable"
+"Show the separate Fable weekly usage block" = "Show the separate Fable weekly usage block"

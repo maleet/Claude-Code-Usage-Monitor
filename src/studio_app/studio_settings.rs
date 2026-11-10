@@ -161,6 +161,28 @@ impl StudioApp {
                             }
                         },
                     );
+                    if descriptor.id == ProviderId::Claude {
+                        ui.add_enabled_ui(
+                            self.settings.provider_enabled(ProviderId::Claude),
+                            |ui| {
+                                setting_row(
+                                    ui,
+                                    language.text("Claude Fable"),
+                                    language.text("Show the separate Fable weekly usage block"),
+                                    |ui| {
+                                        changed |=
+                                            Toggle::new(&mut self.settings.show_claude_fable)
+                                                .labels(
+                                                    language.text("Enabled"),
+                                                    language.text("Disabled"),
+                                                )
+                                                .show(ui)
+                                                .changed();
+                                    },
+                                );
+                            },
+                        );
+                    }
                     if matches!(descriptor.id, ProviderId::Claude | ProviderId::Codex) {
                         let enabled = self.settings.provider_enabled(descriptor.id);
                         let accounts = match descriptor.id {

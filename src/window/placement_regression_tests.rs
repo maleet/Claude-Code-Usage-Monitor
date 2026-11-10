@@ -14,6 +14,7 @@ pub(super) fn state_for(theme: ThemeDocument, placement: PlacementOverride) -> A
         providers: ProviderSet::default(),
         show_antigravity_gemini: true,
         show_antigravity_external: true,
+        show_claude_fable: false,
         crossfade_opacity: 1.0,
         accounts: Default::default(),
         data: None,

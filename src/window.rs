@@ -100,6 +100,7 @@ struct AppState {
     providers: ProviderSet,
     pub(super) show_antigravity_gemini: bool,
     pub(super) show_antigravity_external: bool,
+    show_claude_fable: bool,
     crossfade_opacity: f64,
     accounts: crate::accounts::AccountSettings,
 
@@ -791,6 +792,7 @@ fn theme_runtime_from_state(state: &AppState) -> ThemeRuntime {
     };
     let opacity = state.floating_card_opacity.unwrap_or(85);
     ThemeRuntime::from_providers(state.providers)
+        .with_claude_fable(state.show_claude_fable)
         .with_poll_state(poll_ok, has_error)
         .with_language(state.language)
         .with_countdown(state.usage_countdown)
@@ -1026,6 +1028,7 @@ fn save_state_settings() {
             .map(|language| language.code().to_string());
         persisted.last_update_check_unix = s.last_update_check_unix;
         persisted.set_enabled_providers(s.providers);
+        persisted.show_claude_fable = s.show_claude_fable;
         // Pool flags are only meaningful while Antigravity is enabled; persisting
         // them as on for a disabled provider would re-enable it on the next load.
         let antigravity_on = s.providers.contains(ProviderId::Antigravity);
@@ -2588,6 +2591,7 @@ pub fn run() {
                 install_channel,
                 providers: settings.enabled_providers(),
                 show_antigravity_gemini: settings.antigravity_gemini_enabled(),
+                show_claude_fable: settings.show_claude_fable,
                 show_antigravity_external: settings.antigravity_external_enabled(),
                 crossfade_opacity: 1.0,
                 accounts: settings.accounts.clone(),
@@ -3449,6 +3453,7 @@ fn reload_external_settings(hwnd: HWND) {
         state.poll_interval_ms = settings.poll_interval_ms;
         state.providers = settings.enabled_providers();
         state.usage_countdown = settings.usage_countdown;
+        state.show_claude_fable = settings.show_claude_fable;
         state.use_windows_default_font = settings.use_windows_default_font;
         dual_mode = state.show_antigravity_gemini
             && state.show_antigravity_external

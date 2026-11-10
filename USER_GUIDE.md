@@ -92,6 +92,13 @@ Custom theme files are stored in:
 These settings save automatically. The default theme adapts to enabled providers;
 a custom theme must include layers for the providers you want to display.
 
+**Claude Fable** is an optional display switch under **Providers**, disabled by default.
+Enable it to show the separate Fable weekly block alongside Claude's general usage.
+Disabling it removes the extra block and its reserved width in the Classic and Compact
+Fluent themes. Claude must be enabled; Fable uses the same Claude account and refresh.
+Custom themes can use `claude.fable.enabled` to follow this setting; quota data remains
+available through the existing model-limit variables.
+
 ## Show used or remaining allowance
 
 1. Open **Settings > Display**.

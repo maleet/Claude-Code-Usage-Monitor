@@ -26,6 +26,7 @@ impl StudioApp {
     pub(super) fn theme_runtime(&self) -> ThemeRuntime {
         let language = self.language();
         ThemeRuntime::from_providers(self.settings.enabled_providers())
+            .with_claude_fable(self.settings.show_claude_fable)
             .with_poll_state(self.usage_poll_ok, self.usage_has_error)
             .with_language(language)
             .with_countdown(self.settings.usage_countdown)

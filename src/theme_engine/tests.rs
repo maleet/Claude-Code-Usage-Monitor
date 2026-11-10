@@ -905,7 +905,9 @@ fn built_in_themes_hide_absent_claude_sessions_and_keep_weekly_and_fable_limits(
                 },
             )]);
             for countdown in [false, true] {
-                let runtime = ThemeRuntime::new(true, false, false).with_countdown(countdown);
+                let runtime = ThemeRuntime::new(true, false, false)
+                    .with_claude_fable(true)
+                    .with_countdown(countdown);
                 let (width, height) = resolve_surface_size(&theme, 0, Some(&usage), runtime);
                 let canvas = Canvas {
                     width,
@@ -974,7 +976,7 @@ fn built_in_classic_adds_a_fable_column_when_the_limit_is_available() {
             &theme,
             0,
             Some(&usage),
-            ThemeRuntime::new(true, false, false)
+            ThemeRuntime::new(true, false, false).with_claude_fable(true)
         ),
         (310, 46)
     );
@@ -1015,7 +1017,7 @@ fn horizontal_fable_columns_follow_claude_visibility_and_usage_direction() {
             .iter()
             .position(|object| object.id == "fable-provider")
             .unwrap();
-        let disabled = ThemeRuntime::new(false, true, false);
+        let disabled = ThemeRuntime::new(false, true, false).with_claude_fable(true);
         assert_eq!(
             resolve_surface_size(&theme, 0, Some(&usage), disabled),
             resolve_surface_size(&theme, 0, None, disabled),
@@ -1029,6 +1031,7 @@ fn horizontal_fable_columns_follow_claude_visibility_and_usage_direction() {
         for (countdown, percentage, text) in [(false, 43.0, "Fable 43%"), (true, 57.0, "Fable 57%")]
         {
             let runtime = ThemeRuntime::from_providers(ProviderSet::from_enabled(ProviderId::ALL))
+                .with_claude_fable(true)
                 .with_countdown(countdown);
             let (width, height) = resolve_surface_size(&theme, 0, Some(&usage), runtime);
             let canvas = Canvas {
@@ -1069,6 +1072,71 @@ fn horizontal_fable_columns_follow_claude_visibility_and_usage_direction() {
             let rendered = render_theme_surface_with_runtime(&theme, 0, Some(&usage), runtime);
             assert!(rendered.warnings.is_empty(), "{:?}", rendered.warnings);
         }
+    }
+}
+
+#[test]
+fn hiding_fable_removes_its_column_width_without_hiding_claude_or_quota_data() {
+    use crate::models::{UsageData, UsageLimit, UsageSection};
+    let usage = AppUsageData::from_iter([(
+        ProviderId::Claude,
+        UsageData {
+            session: UsageSection {
+                available: true,
+                percentage: 22.0,
+                ..Default::default()
+            },
+            weekly: UsageSection {
+                available: true,
+                percentage: 48.0,
+                ..Default::default()
+            },
+            limits: vec![UsageLimit {
+                key: "weekly_scoped_fable".into(),
+                kind: "weekly_scoped".into(),
+                model: Some("Fable".into()),
+                usage: UsageSection {
+                    available: true,
+                    percentage: 40.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    )]);
+    for (theme, extra_width) in [
+        (ThemeDocument::starter(), 93),
+        (
+            serde_json::from_str(include_str!("../themes/compact-fluent-quad.json")).unwrap(),
+            96,
+        ),
+    ] {
+        let hidden = ThemeRuntime::new(true, false, false);
+        let shown = hidden.with_claude_fable(true);
+        let base = resolve_surface_size(&theme, 0, None, hidden);
+        assert_eq!(resolve_surface_size(&theme, 0, Some(&usage), hidden), base);
+        assert_eq!(
+            resolve_surface_size(&theme, 0, Some(&usage), shown),
+            (base.0 + extra_width, base.1)
+        );
+        let fable = theme.surfaces[0]
+            .children
+            .iter()
+            .position(|object| object.id == "fable-provider")
+            .unwrap();
+        assert!(
+            resolve_object_bounds_with_runtime(&theme, 0, fable, Some(&usage), hidden).is_none()
+        );
+        assert!(
+            resolve_object_bounds_with_runtime(&theme, 0, fable, Some(&usage), shown).is_some()
+        );
+        let context = DataContext::from_usage_with_runtime(Some(&usage), &theme.canvas, hidden);
+        assert_eq!(context.get("claude.fable.enabled"), Some(0.0));
+        assert_eq!(context.get("providers.claude.enabled"), Some(1.0));
+        assert_eq!(context.get("claude.session.percentage"), Some(22.0));
+        assert_eq!(context.get("claude.weekly.percentage"), Some(48.0));
+        assert_eq!(context.get("claude.model.fable.percentage"), Some(40.0));
     }
 }
 
@@ -1583,7 +1651,7 @@ fn compact_fluent_quad_adds_a_fable_column_when_the_limit_is_available() {
             ..Default::default()
         },
     )]);
-    let runtime = ThemeRuntime::new(true, false, false);
+    let runtime = ThemeRuntime::new(true, false, false).with_claude_fable(true);
     let (base_width, height) = resolve_surface_size(&theme, 0, None, runtime);
 
     assert_eq!(

@@ -1352,6 +1352,7 @@ pub struct ThemeRuntime {
     pub surface_nest: SurfaceNest,
     pub floating_card_opacity: u8,
     pub antigravity_gemini_enabled: bool,
+    pub claude_fable_enabled: bool,
     pub antigravity_external_enabled: bool,
     pub crossfade_opacity: f64,
     host_width: u32,
@@ -1370,6 +1371,7 @@ impl Default for ThemeRuntime {
             surface_nest: SurfaceNest::Taskbar,
             floating_card_opacity: 85,
             antigravity_gemini_enabled: true,
+            claude_fable_enabled: false,
             antigravity_external_enabled: false,
             crossfade_opacity: 1.0,
             host_width: default_canvas_width(),
@@ -1405,11 +1407,17 @@ impl ThemeRuntime {
             surface_nest: SurfaceNest::Taskbar,
             floating_card_opacity: 85,
             antigravity_gemini_enabled: agy,
+            claude_fable_enabled: false,
             antigravity_external_enabled: false,
             crossfade_opacity: 1.0,
             host_width: default_canvas_width(),
             host_height: default_canvas_height(),
         }
+    }
+
+    pub fn with_claude_fable(mut self, enabled: bool) -> Self {
+        self.claude_fable_enabled = enabled;
+        self
     }
 
     pub fn with_antigravity_pools(
@@ -1556,6 +1564,11 @@ impl DataContext {
             );
         }
         context.insert("display.countdown", runtime.countdown as u8 as f64);
+        context.insert(
+            "claude.fable.enabled",
+            (runtime.claude_fable_enabled && runtime.provider_enabled(ProviderId::Claude)) as u8
+                as f64,
+        );
         context.insert(
             "antigravity.gemini.enabled",
             runtime.antigravity_gemini_enabled as u8 as f64,

@@ -53,6 +53,8 @@ pub struct SettingsFile {
     #[serde(default = "default_true")]
     show_claude_code: bool,
     #[serde(default)]
+    pub show_claude_fable: bool,
+    #[serde(default)]
     show_codex: bool,
     #[serde(default)]
     show_antigravity: bool,
@@ -135,6 +137,7 @@ impl Default for SettingsFile {
             language: None,
             last_update_check_unix: None,
             show_claude_code: true,
+            show_claude_fable: false,
             show_codex: false,
             show_antigravity: false,
             show_antigravity_gemini: None,
@@ -511,6 +514,18 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fable_is_opt_in_and_the_choice_survives_settings_round_trips() {
+        let mut settings = decode_settings("{}").unwrap();
+        settings.normalize();
+        assert!(settings.provider_enabled(ProviderId::Claude));
+        assert!(!settings.show_claude_fable);
+        settings.show_claude_fable = true;
+        let restored = decode_settings(&settings_json(&settings).to_string()).unwrap();
+        assert!(restored.show_claude_fable);
+        assert!(restored.provider_enabled(ProviderId::Claude));
+    }
 
     #[test]
     fn alert_upgrade_keeps_thresholds_and_allows_taskbar_auto_ejection() {
